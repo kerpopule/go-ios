@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/tunnel"
 	"github.com/docopt/docopt-go"
 )
@@ -50,6 +54,11 @@ func dispatchTunnelCommand(ctx tunnelCommandContext) bool {
 	}
 	stopagent, _ := ctx.Args.Bool("stopagent")
 	listCommand, _ := ctx.Args.Bool("ls")
+	networkCommand, _ := ctx.Args.Bool("network")
+	if networkCommand {
+		startNetworkTunnel(context.TODO(), ctx.Args)
+		return true
+	}
 	if startCommand {
 		pairRecordsPath, _ := ctx.Args.String("--pair-record-path")
 		if len(pairRecordsPath) == 0 {
@@ -115,4 +124,58 @@ func dispatchTunnelCommand(ctx tunnelCommandContext) bool {
 		}
 	}
 	return true
+}
+
+// startNetworkTunnel brings up the CoreDevice tunnel over Wi-Fi and holds it open.
+//
+// Deliberately NOT routed through TunnelManager. That manager enumerates
+// devices through usbmux, which by definition cannot see a phone with no cable
+// attached — every gate in it would have to be loosened to let a Wi-Fi device
+// through, and loosening the cable-wins invariant is how the USB path breaks.
+// This is a separate road to the same tunnel.
+func startNetworkTunnel(ctx context.Context, args docopt.Opts) {
+	recordsPath, _ := args.String("--pair-record-path")
+	if len(recordsPath) == 0 {
+		recordsPath = "."
+	}
+	if strings.ToLower(recordsPath) == "default" {
+		recordsPath = "/var/db/lockdown/RemotePairing/user_501"
+	}
+	wait := 6 * time.Second
+	if seconds, err := args.Int("--browse-timeout"); err == nil && seconds > 0 {
+		wait = time.Duration(seconds) * time.Second
+	}
+
+	pm, err := tunnel.NewPairRecordManager(recordsPath)
+	exitIfError("could not create pair record manager", err)
+
+	slog.Info("browsing for a device on this network", "service", "_remotepairing._tcp", "wait", wait)
+	endpoint, err := ios.FindRemotePairingEndpoint(ctx, wait)
+	exitIfError("no device answered over Wi-Fi", err)
+	slog.Info("found a device", "host", endpoint.HostName, "address", endpoint.Address(), "txt", endpoint.Text)
+
+	// The UDID is not carried in the advertisement (see RemotePairingEndpoint),
+	// so it is taken from --udid when given and otherwise left empty; the RSD
+	// handshake inside the tunnel reports the real one either way.
+	device := ios.DeviceEntry{}
+	device.Properties.SerialNumber = tunnelTargetUDID(args)
+
+	t, err := tunnel.ConnectToTunnelOverRemotePairing(ctx, endpoint, device, pm)
+	exitIfError("failed to bring up the Wi-Fi tunnel", err)
+	defer func() { _ = t.Close() }()
+
+	// The same shape `ios tunnel ls` prints and phone-bridge.sh already parses.
+	info, err := json.Marshal([]tunnel.Tunnel{t})
+	exitIfError("failed to encode tunnel info", err)
+	fmt.Println(string(info))
+
+	slog.Info("tunnel up over Wi-Fi - no cable", "address", t.Address, "rsdPort", t.RsdPort, "udid", t.Udid)
+	slog.Info("holding the tunnel open; press Ctrl-C to close it")
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-signals:
+		slog.Info("closing the tunnel")
+	case <-ctx.Done():
+	}
 }

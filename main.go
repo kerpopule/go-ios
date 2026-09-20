@@ -158,6 +158,7 @@ Usage:
   ios tunnel stop [options]
   ios tunnel refresh [options]
   ios tunnel start [options] [--pair-record-path=<pairrecordpath>] [--userspace]
+  ios tunnel network [options] [--pair-record-path=<pairrecordpath>] [--browse-timeout=<seconds>]
   ios tunnel stopagent
   ios ui install (wda | devicekit) --p12file=<p12file> --profile=<mobileprovision> [--p12password=<password>] [--path=<ipaOrZipOrApp>] [--output=<signedPath>] [--bundleid=<bundleid>] [options]
   ios ui run (wda | devicekit) [--bundleid=<bundleid>] [--test-runner-bundleid=<id>] [--xctest-config=<name>] [--host-port=<port>] [--log-output=<file>] [options]
@@ -586,6 +587,16 @@ The commands work as following:
     ios tunnel stop --udid=<udid>                                   Stop the tunnel for one device without stopping the tunnel agent.
 
     ios tunnel refresh --udid=<udid>                                Stop the tunnel for one device and wait until the agent recreates it.
+
+    ios tunnel network [options] [--pair-record-path=<pairrecordpath>] [--browse-timeout=<seconds>]
+                                                                    Creates a tunnel over WI-FI, with no cable, to a device advertising
+                                                                    _remotepairing._tcp on this network. Prints the tunnel address and RSD
+                                                                    port as JSON and holds the tunnel open until interrupted.
+                                                                    The phone must be AWAKE and on this network (a sleeping iPhone keeps
+                                                                    advertising long after it stops answering), must have Developer Mode on,
+                                                                    and must already be paired with this Mac - this path can only VERIFY an
+                                                                    existing pairing, never create one. Pair once over a cable, or from the
+                                                                    phone's Settings > Developer > Paired Macs, and it works from then on.
 
     ios tunnel start [options] [--pair-record-path=<pairrecordpath>] [--enabletun]
                                                                     Creates a tunnel connection to the device.

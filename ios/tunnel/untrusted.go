@@ -14,7 +14,6 @@ import (
 
 	"github.com/danielpaulus/go-ios/ios/golog"
 	"github.com/danielpaulus/go-ios/ios/opack"
-	"github.com/danielpaulus/go-ios/ios/xpc"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/ed25519"
@@ -25,18 +24,21 @@ import (
 // ethernet interface of the device (not the tunnel interface)
 const untrustedTunnelServiceName = "com.apple.internal.dt.coredevice.untrusted.tunnelservice"
 
-func newTunnelServiceWithXpc(xpcConn *xpc.Connection, c io.Closer, pairRecords PairRecordManager) *tunnelService {
+// newTunnelServiceWithXpc takes the control channel as the xpcConn INTERFACE
+// rather than the concrete RemoteXPC connection, so the identical pairing state
+// machine can run over the Wi-Fi RPPairing transport (rppairing.go). The
+// concrete type was never used for anything here beyond being stored, and the
+// USB callers pass *xpc.Connection exactly as before.
+func newTunnelServiceWithXpc(conn xpcConn, c io.Closer, pairRecords PairRecordManager) *tunnelService {
 	return &tunnelService{
-		xpcConn:        xpcConn,
 		c:              c,
-		controlChannel: newControlChannelReadWriter(xpcConn),
+		controlChannel: newControlChannelReadWriter(conn),
 		pairRecords:    pairRecords,
 	}
 }
 
 type tunnelService struct {
-	xpcConn *xpc.Connection
-	c       io.Closer
+	c io.Closer
 
 	controlChannel *controlChannelReadWriter
 	cipher         *cipherStream
