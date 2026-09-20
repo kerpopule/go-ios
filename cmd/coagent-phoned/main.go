@@ -1,0 +1,913 @@
+// coagent-phoned: resident see/act bridge to one iPhone over CoreDevice (iOS 27+).
+// Loopback HTTP only, bearer token required. Fails closed: every error is a
+// specific reason string, never a silent success and never another route.
+//
+// Two transports reach the phone and they fail independently:
+//
+//	tunnel (RSD/DTX)  -> /screenshot, /launch, /tap, /swipe
+//	usbmux + lockdown -> /apps
+//
+// On 2026-09-19 the second was dead while the first was fine, and /status still
+// answered {ok:true, see:true, act:true} because it only proved the tunnel. The
+// user asked to open Mail on his phone and got "I was unable to". So /status is
+// now a probe that reports the three capabilities separately, and no route is
+// allowed to latch a device that has stopped answering.
+//
+// Each capability says what actually established it. "apps" is NOT presence on
+// the usbmux bus: on 2026-09-19 the phone was present under a new DeviceID and
+// lockdown refused every connect with error code:2, so presence would still
+// have sworn everything was fine. It means "I opened the lockdown channel
+// installationproxy opens first and the phone answered", or else down/unknown.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/danielpaulus/go-ios/ios"
+	"github.com/danielpaulus/go-ios/ios/display"
+	"github.com/danielpaulus/go-ios/ios/hid"
+	"github.com/danielpaulus/go-ios/ios/installationproxy"
+	"github.com/danielpaulus/go-ios/ios/instruments"
+	"github.com/danielpaulus/go-ios/ios/tunnel"
+	"github.com/google/uuid"
+)
+
+// RSD service names. Presence of a port for these in the handshake table is what
+// "see" and "act" actually depend on. Reading the table is a map lookup, but
+// probe() deliberately does NOT hold an old table: it re-resolves, and
+// resolveDevice performs a live RSD Handshake over the tunnel every call. That
+// is one control-channel round trip to the phone's tunnel endpoint — it starts
+// no service, draws nothing and does not wake the screen — but it is not free,
+// so poll /status on the order of seconds, not milliseconds.
+const (
+	svcScreenshot = "com.apple.instruments.dtservicehub"
+	svcHID        = "com.apple.coredevice.hid.universalhidservice"
+)
+
+// Reasons. The daemon turns these into the words the user hears, so states that
+// need different words must never share a string.
+const (
+	reasonNotConnected   = "phone_not_connected"       // no usbmux entry: the phone is not on this Mac
+	reasonMuxUnreachable = "phone_usbmuxd_unreachable" // usbmuxd on THIS Mac did not answer
+	reasonAppsUnreadable = "phone_apps_unreadable"     // phone is here, but lockdown/installationproxy would not open
+	reasonAppsFailed     = "phone_apps_failed"         // proxy opened, the app listing itself failed
+	reasonAppsUnprobed   = "phone_apps_unprobed"       // the lockdown probe is switched off: nothing was established
+)
+
+// reasonMuxUnreachable replaced an earlier reason string, phone_list_failed,
+// which is gone from this binary. Nothing referenced it, but a reason string is
+// a word the user eventually hears, so its removal is recorded here rather than
+// discovered later by diffing two binaries.
+
+// How a capability was established. "up" without a proof would be exactly the
+// claim that caused the incident, so every up/down carries one.
+const (
+	capUp      = "up"
+	capDown    = "down"
+	capUnknown = "unknown"
+
+	proofRSD      = "rsd_service_table" // the freshly handshaken RSD service table
+	proofLockdown = "lockdown_session"  // the lockdown channel installationproxy opens first
+	proofListed   = "apps_listed"       // a real /apps listing already answered
+
+	// envAppsProbe=off turns the lockdown probe off. Then "apps" is reported
+	// unknown — never up — because nothing has been established.
+	envAppsProbe = "COAGENT_PHONE_APPS_PROBE"
+)
+
+// appsProbeTTL bounds how often the lockdown channel is opened. A watchdog
+// polling /status must not open a new lockdown session every poll, and a
+// seconds-old answer is still an answer the phone actually gave.
+var appsProbeTTL = 5 * time.Second
+
+// listDevices and resolve are indirected so tests can drive every branch with a
+// fake. Nothing in a test may touch the user's actual phone.
+var (
+	listDevices = ios.ListDevices
+	resolve     = resolveDevice
+	listApps    = listAppsOn
+
+	// probeLockdown opens exactly the channel installationproxy opens first —
+	// usbmux Connect to the lockdown port, then StartSession with the stored
+	// pair record — and closes it again. It starts no service, launches
+	// nothing, draws nothing, and neither unlocks nor wakes the phone: it is
+	// the same control channel Finder holds while the phone sits locked in a
+	// pocket. It is the only way to learn what /apps would do without asking
+	// the phone for its whole app list.
+	probeLockdown = func(d ios.DeviceEntry) error {
+		c, err := ios.ConnectLockdownWithSession(d)
+		if err != nil {
+			return fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
+		}
+		c.Close()
+		return nil
+	}
+
+	// handshake opens the RSD control channel over the tunnel and hands back
+	// the freshly read service table. It is indirected for the same reason as
+	// listDevices: the device SELECTION that follows it lives inside
+	// resolveDevice, so a test that swaps `resolve` wholesale can never see
+	// which entry resolveDevice actually caches. With this seam a test can run
+	// the real resolveDevice with no tunnel and no phone.
+	handshake = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, error) {
+		rsd, err := ios.NewWithAddrPortDevice(info.Address, info.RsdPort, d)
+		if err != nil {
+			return nil, fmt.Errorf("phone_tunnel_unreachable: %w", err)
+		}
+		p, err := rsd.Handshake()
+		rsd.Close()
+		if err != nil {
+			return nil, fmt.Errorf("phone_handshake_failed: %w", err)
+		}
+		return p, nil
+	}
+)
+
+type bridge struct {
+	mu     sync.Mutex
+	dev    ios.DeviceEntry
+	ready  bool
+	recv   *display.Receiver
+	svc    *display.Service
+	stream uuid.UUID
+	hid    *hid.Session
+	lastOK time.Time
+
+	// Read path (screenshot, launch, apps) must never wait on a gesture: a 3 s
+	// drag held mu, so a "mid-drag" screenshot was really taken after release.
+	devMu    sync.RWMutex
+	devReady bool
+	devCopy  ios.DeviceEntry
+
+	// Set ONLY when the device the gesture session was built on is proven gone
+	// or different — never because an operation on it failed. The read path
+	// cannot take mu (see above), so this is how it tells the gesture side to
+	// rebuild instead of driving a dead session.
+	stale atomic.Bool
+
+	// What the app-list channel last did, and when. Filled by the /status
+	// probe and by every real /apps call, so the two answer each other.
+	probeMu   sync.Mutex
+	appsProof appsProof
+}
+
+// appsProof is one remembered answer from the app-list channel.
+type appsProof struct {
+	at    time.Time
+	key   string // udid#deviceID the answer belongs to; a re-attach retires it
+	err   error
+	proof string
+}
+
+// pickDevice chooses which attached device is "the phone". The cable wins: a
+// Network entry for the same phone can linger in usbmuxd after the Wi-Fi sync
+// association goes stale, and DeviceList[0] happily handed us that corpse.
+func pickDevice(list ios.DeviceList) (ios.DeviceEntry, error) {
+	if len(list.DeviceList) == 0 {
+		return ios.DeviceEntry{}, fmt.Errorf(reasonNotConnected)
+	}
+	for _, d := range list.DeviceList {
+		if d.Properties.ConnectionType == "USB" {
+			return d, nil
+		}
+	}
+	return list.DeviceList[0], nil
+}
+
+// muxEntry finds udid in a usbmux device list. The returned entry carries the
+// CURRENT DeviceID, which is the whole point: usbmuxd hands out a new DeviceID
+// every time the phone re-attaches, and a cached one makes lockdown answer
+// "Failed connecting to Lockdown with error code:2" while the tunnel routes,
+// which key off Address and not DeviceID, keep working perfectly.
+// It also honours the same cable-wins rule as pickDevice, by running pickDevice
+// over the entries for this udid: usbmuxd lists one phone twice (Network + USB)
+// and picking the Network row here while pickDevice picked USB handed lockdown
+// one DeviceID and the tunnel another.
+func muxEntry(list ios.DeviceList, udid string) (ios.DeviceEntry, bool) {
+	mine := ios.DeviceList{}
+	for _, d := range list.DeviceList {
+		if d.Properties.SerialNumber == udid {
+			mine.DeviceList = append(mine.DeviceList, d)
+		}
+	}
+	d, err := pickDevice(mine)
+	if err != nil {
+		return ios.DeviceEntry{}, false
+	}
+	return d, true
+}
+
+// sameDevice: is this the device a session was built on, or a different one?
+func sameDevice(a, b ios.DeviceEntry) bool {
+	return a.Properties.SerialNumber == b.Properties.SerialNumber &&
+		a.DeviceID == b.DeviceID && a.Address == b.Address
+}
+
+func resolveDevice() (ios.DeviceEntry, error) {
+	list, err := listDevices()
+	if err != nil {
+		return ios.DeviceEntry{}, fmt.Errorf("%s: %w", reasonMuxUnreachable, err)
+	}
+	dev, err := pickDevice(list)
+	if err != nil {
+		return ios.DeviceEntry{}, err
+	}
+	udid := dev.Properties.SerialNumber
+	live, liveErr := tunnelInfoForDevice(udid, "127.0.0.1", 28100)
+	info, err := chooseTunnel(udid, live, liveErr, os.Getenv("COAGENT_PHONE_ADDR"), os.Getenv("COAGENT_PHONE_RSD"))
+	if err != nil {
+		return dev, err
+	}
+	provider, err := handshake(info, dev)
+	if err != nil {
+		return dev, err
+	}
+	// Re-select through the SAME seam and the SAME selector cacheLive uses.
+	// This used to be ios.GetDeviceWithAddress, which returns the FIRST entry
+	// whose SerialNumber matches with no cable-wins rule, and which calls
+	// ios.ListDevices() itself rather than the listDevices seam. With a stale
+	// Network row listed ahead of the USB row that handed device() a Network
+	// entry while cacheLive's muxEntry picked the USB one; they disagreed, and
+	// every successful call therefore invalidated the gesture session.
+	d, err := selectDevice(udid)
+	if err != nil {
+		return dev, err
+	}
+	d.Address = info.Address
+	d.Rsd = provider
+	return d, nil
+}
+
+// selectDevice is the one device selector: read usbmuxd through the listDevices
+// seam, then apply the cable-wins rule via muxEntry — exactly what cacheLive
+// re-checks against. Nothing else in this binary may pick a device.
+func selectDevice(udid string) (ios.DeviceEntry, error) {
+	list, err := listDevices()
+	if err != nil {
+		return ios.DeviceEntry{}, fmt.Errorf("%s: %w", reasonMuxUnreachable, err)
+	}
+	d, found := muxEntry(list, udid)
+	if !found {
+		return ios.DeviceEntry{}, fmt.Errorf("%s: %s is no longer on the usbmux bus", reasonNotConnected, udid)
+	}
+	return d, nil
+}
+
+func (b *bridge) teardown() {
+	if b.hid != nil {
+		b.hid.Close()
+		b.hid = nil
+	}
+	if b.svc != nil {
+		b.svc.StopMediaStream(context.Background(), b.stream)
+		b.svc.Close()
+		b.svc = nil
+	}
+	if b.recv != nil {
+		b.recv.Close()
+		b.recv = nil
+	}
+	b.ready = false
+	b.devMu.Lock()
+	b.devReady = false
+	b.devMu.Unlock()
+}
+
+// dropDevice forgets which device the read path should use, so the next call
+// re-selects one. It does NOT condemn the gesture session: closing the HID
+// session and the video stream costs the user's next tap a 600 ms sleep plus a
+// StartVideoStream with a 15 s timeout, and a locked phone or one failed app
+// listing must never buy that. It takes devMu only, never mu, so a read path
+// can call it while a 3 s drag runs.
+func (b *bridge) dropDevice() {
+	b.devMu.Lock()
+	b.devReady = false
+	b.devMu.Unlock()
+}
+
+// markStale condemns the gesture session. Reserved for the one thing that
+// really does kill it: the device it was built on is gone or is now a
+// different device.
+func (b *bridge) markStale() { b.stale.Store(true) }
+
+// invalidate is both: the cached device is wrong AND the session built on it is
+// dead. Use it only where the device identity itself changed or vanished.
+func (b *bridge) invalidate() {
+	b.dropDevice()
+	b.markStale()
+}
+
+// ensure brings up device + video stream + HID. Caller holds mu.
+func (b *bridge) ensure() error {
+	if b.ready && !b.stale.Load() {
+		return nil
+	}
+	b.teardown()
+	// Cleared before the rebuild, not after: an invalidation raised while we are
+	// rebuilding then costs one extra rebuild instead of being silently lost.
+	b.stale.Store(false)
+	d, err := resolve()
+	if err != nil {
+		return err
+	}
+	b.dev = d
+	recv, err := display.OpenReceiver(d)
+	if err != nil {
+		return fmt.Errorf("phone_stream_receiver_failed: %w", err)
+	}
+	b.recv = recv
+	go func(r *display.Receiver) {
+		buf := make([]byte, 65536)
+		for {
+			if _, e := r.Read(buf); e != nil {
+				return
+			}
+		}
+	}(recv)
+	svc, err := display.New(d)
+	if err != nil {
+		b.teardown()
+		return fmt.Errorf("phone_display_service_failed: %w", err)
+	}
+	b.svc = svc
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	sid, err := svc.StartVideoStream(ctx, display.VideoStreamRequest{ReceiverIP: recv.IP(), ReceiverPort: recv.Port(), SenderIP: d.Address})
+	if err != nil {
+		b.teardown()
+		return fmt.Errorf("phone_stream_start_failed: %w", err)
+	}
+	b.stream = sid
+	time.Sleep(600 * time.Millisecond)
+	s, err := hid.NewSession(d)
+	if err != nil {
+		b.teardown()
+		return fmt.Errorf("phone_hid_failed: %w", err)
+	}
+	b.hid = s
+	b.ready = true
+	b.devMu.Lock()
+	b.devCopy, b.devReady = d, true
+	b.devMu.Unlock()
+	return nil
+}
+
+func pt(x, y float64) hid.Point { return hid.Point{X: uint16(x * 65535), Y: uint16(y * 65535)} }
+
+func unit(v float64) bool { return v >= 0 && v <= 1 }
+
+// withHID runs fn once, and on failure rebuilds the session and retries once.
+func (b *bridge) withHID(fn func(*hid.Session) error) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := b.ensure(); err != nil {
+			return err
+		}
+		if err := fn(b.hid); err != nil {
+			b.teardown()
+			if attempt == 1 {
+				return fmt.Errorf("phone_touch_failed: %w", err)
+			}
+			continue
+		}
+		b.lastOK = time.Now()
+		return nil
+	}
+	return nil
+}
+
+// cacheLive re-checks the cached entry against the local usbmux list. If usbmuxd
+// itself will not answer we have not DISPROVED the cache, so we keep it: the
+// tunnel routes may well still work and guessing "gone" would be its own lie.
+func cacheLive(d ios.DeviceEntry) bool {
+	live, err := listDevices()
+	if err != nil {
+		return true
+	}
+	cur, found := muxEntry(live, d.Properties.SerialNumber)
+	return found && cur.DeviceID == d.DeviceID
+}
+
+// device returns a device for the tunnel routes. The cache is never trusted
+// blind: it is re-checked against usbmuxd on this Mac first, which is a unix
+// socket round trip to a local daemon and never reaches the phone, so it can
+// never wake or interrupt it.
+func (b *bridge) device() (ios.DeviceEntry, error) {
+	b.devMu.RLock()
+	d, cached := b.devCopy, b.devReady
+	b.devMu.RUnlock()
+	if cached {
+		if cacheLive(d) {
+			return d, nil
+		}
+		b.invalidate()
+	}
+	nd, err := resolve()
+	if err != nil {
+		return nd, err
+	}
+	b.devMu.Lock()
+	b.devCopy, b.devReady = nd, true
+	b.devMu.Unlock()
+	return nd, nil
+}
+
+// withDevice runs fn against the current device and, on failure, drops the cache
+// and retries once against a freshly resolved one. Latching a dead device is the
+// defect this exists to prevent.
+func (b *bridge) withDevice(fn func(ios.DeviceEntry) error) error {
+	d, err := b.device()
+	if err != nil {
+		return err
+	}
+	if err = fn(d); err == nil {
+		return nil
+	}
+	// A failed DTX call does not prove the phone changed, and the HID session
+	// does not ride on this call. So drop the device selection, re-resolve, and
+	// condemn the gesture session only if the device really is gone or
+	// different — one transient screenshot failure must not cost the next tap
+	// a full rebuild.
+	b.dropDevice()
+	fresh, rerr := b.device()
+	if rerr != nil {
+		// The re-resolve explains WHY the first call failed, and in better
+		// words: "no phone attached" beats "capture failed".
+		b.markStale()
+		return rerr
+	}
+	if !sameDevice(d, fresh) {
+		b.markStale()
+	}
+	return fn(fresh)
+}
+
+// appsDevice returns the usbmux entry the app list needs. /apps talks lockdown +
+// installationproxy over usbmux and never uses the tunnel, so it must not be made
+// to fail on a tunnel handshake it does not need — and it must use the CURRENT
+// DeviceID, not the one cached when the tunnel was first built.
+func (b *bridge) appsDevice() (ios.DeviceEntry, error) {
+	live, err := listDevices()
+	if err != nil {
+		return ios.DeviceEntry{}, fmt.Errorf("%s: %w", reasonMuxUnreachable, err)
+	}
+	return b.appsEntry(live)
+}
+
+// appsEntry picks that entry out of a list already in hand, so /status probes
+// the very entry /apps would use instead of a second, differently chosen one.
+func (b *bridge) appsEntry(live ios.DeviceList) (ios.DeviceEntry, error) {
+	b.devMu.RLock()
+	udid, known := b.devCopy.Properties.SerialNumber, b.devReady
+	b.devMu.RUnlock()
+	if known {
+		if cur, found := muxEntry(live, udid); found {
+			return cur, nil
+		}
+		// The phone we were using is no longer on the bus: identity gone, so
+		// the gesture session built on it is dead too.
+		b.invalidate()
+	}
+	return pickDevice(live)
+}
+
+func appRow(a installationproxy.AppInfo) map[string]any {
+	// Half of what the device reports is not an app you can open: extensions
+	// and internal services carry SBAppTags "hidden" and have no icon. Two
+	// of them are literally called "Mail", which is why "open the mail app"
+	// came back ambiguous with two identical choices.
+	hidden := false
+	if tags, ok := a["SBAppTags"].([]interface{}); ok {
+		for _, t := range tags {
+			if s, ok := t.(string); ok && s == "hidden" {
+				hidden = true
+			}
+		}
+	}
+	_, hasIcons := a["CFBundleIcons"]
+	if !hasIcons {
+		_, hasIcons = a["CFBundleIconFiles"]
+	}
+	name := a.CFBundleName()
+	if d, ok := a["CFBundleDisplayName"].(string); ok && d != "" {
+		name = d
+	}
+	kind, _ := a["ApplicationType"].(string)
+	return map[string]any{
+		"bundleId":   a.CFBundleIdentifier(),
+		"name":       name,
+		"bundleName": a.CFBundleName(),
+		"type":       kind,
+		"openable":   hasIcons && !hidden,
+	}
+}
+
+func listAppsOn(d ios.DeviceEntry) ([]map[string]any, error) {
+	ip, err := installationproxy.New(d)
+	if err != nil {
+		// The phone IS on this Mac (we just read it out of usbmuxd) but lockdown
+		// or the install proxy would not open: not trusted, locked, or the mux
+		// entry went stale under us. Different words from "not connected".
+		return nil, fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
+	}
+	defer ip.Close()
+	out := []map[string]any{}
+	for _, browse := range []func() ([]installationproxy.AppInfo, error){ip.BrowseUserApps, ip.BrowseSystemApps} {
+		apps, err := browse()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", reasonAppsFailed, err)
+		}
+		for _, a := range apps {
+			out = append(out, appRow(a))
+		}
+	}
+	return out, nil
+}
+
+// apps lists the phone's apps, retrying once against a re-selected device. Every
+// outcome is remembered: a listing that just worked is the best possible proof
+// for /status, and one that just failed is the truth /status must report.
+func (b *bridge) apps() ([]map[string]any, error) {
+	d, err := b.appsDevice()
+	if err != nil {
+		return nil, err
+	}
+	out, err := listApps(d)
+	b.noteApps(d, err, proofListed)
+	if err == nil {
+		return out, nil
+	}
+	// The app-list channel failed. That is no evidence about the gesture
+	// session — a merely locked phone lands here — so the HID session and the
+	// video stream stay up and only the device selection is dropped.
+	b.dropDevice()
+	fresh, rerr := b.appsDevice()
+	if rerr != nil {
+		return nil, rerr
+	}
+	out, err = listApps(fresh)
+	b.noteApps(fresh, err, proofListed)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// noteApps remembers what the app-list channel last did, for this exact device.
+func (b *bridge) noteApps(d ios.DeviceEntry, err error, proof string) {
+	b.probeMu.Lock()
+	b.appsProof = appsProof{at: time.Now(), key: appsKey(d), err: err, proof: proof}
+	b.probeMu.Unlock()
+}
+
+func appsKey(d ios.DeviceEntry) string {
+	return d.Properties.SerialNumber + "#" + strconv.Itoa(d.DeviceID)
+}
+
+// status is a probe, not a latch: it re-asks all three transports every time and
+// reports them separately, because the incident was one of them being dead while
+// the other answered for it.
+//
+// The shape is what a caller must ACT on, so each capability carries its own
+// state and its own reason: the daemon needs to say "your iPhone is not
+// connected to this Mac" for one and "I can see it but cannot open its app
+// list" for another, and a single bool cannot carry that.
+type capability struct {
+	State  string `json:"state"`            // capUp, capDown or capUnknown
+	Proof  string `json:"proof,omitempty"`  // what was actually opened or read
+	Reason string `json:"reason,omitempty"` // set whenever State is not capUp
+	Detail string `json:"detail,omitempty"` // the underlying error, for logs
+	AgeMs  int64  `json:"ageMs,omitempty"`  // >0: answered from the brief cache
+}
+
+func (c capability) up() bool { return c.State == capUp }
+
+type status struct {
+	// OK is true only when all three are up. unknown is not ok: a caller that
+	// reads only this field now fails closed, which is the opposite of what
+	// happened on 2026-09-19.
+	OK     bool       `json:"ok"`
+	UDID   string     `json:"udid,omitempty"`
+	See    capability `json:"see"`
+	Act    capability `json:"act"`
+	Apps   capability `json:"apps"`
+	Reason string     `json:"reason,omitempty"` // the first capability that is not up
+	Detail string     `json:"detail,omitempty"`
+}
+
+// appsCapability answers what /apps would do, by opening the channel /apps
+// opens. Presence on the usbmux bus is not evidence: the incident state was a
+// phone present on the bus whose lockdown channel refused with error code:2.
+func (b *bridge) appsCapability(d ios.DeviceEntry) capability {
+	// The remembered answer comes FIRST, before the probe switch. envAppsProbe
+	// bounds what this function may OPEN; it is not permission to forget what
+	// the phone already said. Reading it first threw away an /apps listing that
+	// had just succeeded and pinned apps unknown/unprobed for as long as the
+	// switch was set — a fresh "ok=false" over hard proof of ok.
+	key := appsKey(d)
+	b.probeMu.Lock()
+	last := b.appsProof
+	b.probeMu.Unlock()
+	if last.key == key && !last.at.IsZero() {
+		if age := time.Since(last.at); age < appsProbeTTL {
+			c := appsCapabilityFor(last)
+			if ms := age.Milliseconds(); ms > 0 {
+				c.AgeMs = ms
+			}
+			return c
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(envAppsProbe)), "off") {
+		// Nothing is in hand and nothing may be opened, so nothing is claimed.
+		return capability{State: capUnknown, Reason: reasonAppsUnprobed,
+			Detail: envAppsProbe + "=off: the lockdown channel was not opened"}
+	}
+	err := probeLockdown(d)
+	b.noteApps(d, err, proofLockdown)
+	b.probeMu.Lock()
+	fresh := b.appsProof
+	b.probeMu.Unlock()
+	return appsCapabilityFor(fresh)
+}
+
+func appsCapabilityFor(p appsProof) capability {
+	if p.err == nil {
+		return capability{State: capUp, Proof: p.proof}
+	}
+	return capability{State: capDown, Proof: p.proof, Reason: reasonOf(p.err), Detail: p.err.Error()}
+}
+
+func (b *bridge) probe() status {
+	st := status{}
+
+	// apps: usbmux presence first (a local unix socket; it never reaches the
+	// phone), then the lockdown channel itself.
+	live, lerr := listDevices()
+	if lerr != nil {
+		// installationproxy has no route that does not go through usbmuxd, so
+		// this one is a certain no, not an unknown.
+		st.Apps = capability{State: capDown, Reason: reasonMuxUnreachable, Detail: lerr.Error()}
+	} else if d, err := b.appsEntry(live); err != nil {
+		st.Apps = capability{State: capDown, Reason: reasonOf(err)}
+	} else {
+		st.UDID = d.Properties.SerialNumber
+		st.Apps = b.appsCapability(d)
+	}
+
+	// see/act: resolve the tunnel fresh — a cached RSD table is exactly the kind
+	// of stale claim that caused this. No video stream and no HID session are
+	// started here; a probe must not drive the phone.
+	d, err := resolve()
+	if err != nil {
+		down := capability{State: capDown, Reason: reasonOf(err), Detail: err.Error()}
+		st.See, st.Act = down, down
+		// A probe observes; it must not cost the user a rebuild. Drop the
+		// device selection (its RSD table is dead) but leave the gesture
+		// session alone: every acting path re-checks for itself.
+		b.dropDevice()
+	} else {
+		if st.UDID == "" {
+			st.UDID = d.Properties.SerialNumber
+		}
+		if d.Rsd == nil {
+			down := capability{State: capDown, Reason: "phone_handshake_failed"}
+			st.See, st.Act = down, down
+		} else {
+			st.See = capability{State: capUp, Proof: proofRSD}
+			st.Act = capability{State: capUp, Proof: proofRSD}
+			if d.Rsd.GetPort(svcScreenshot) == 0 {
+				st.See = capability{State: capDown, Proof: proofRSD, Reason: "phone_capture_failed"}
+			}
+			if d.Rsd.GetPort(svcHID) == 0 {
+				// dtuhidd ships in the developer disk image, not in iOS.
+				st.Act = capability{State: capDown, Proof: proofRSD, Reason: "phone_hid_failed"}
+			}
+		}
+		b.devMu.Lock()
+		b.devCopy, b.devReady = d, true
+		b.devMu.Unlock()
+	}
+
+	st.OK = st.See.up() && st.Act.up() && st.Apps.up()
+	// The single reason is for a caller that reads one string; the capabilities
+	// are the truth. apps leads because that is the one that was lied about.
+	for _, c := range []capability{st.Apps, st.See, st.Act} {
+		if !c.up() {
+			st.Reason, st.Detail = c.Reason, c.Detail
+			break
+		}
+	}
+	return st
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func reasonOf(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, ":"); i > 0 {
+		return msg[:i]
+	}
+	return msg
+}
+
+func fail(w http.ResponseWriter, err error) {
+	writeJSON(w, 502, map[string]any{"ok": false, "reason": reasonOf(err), "detail": err.Error()})
+}
+
+// tunnelInfoForDevice is a seam so the choice below can be tested without a tunnel.
+var tunnelInfoForDevice = tunnel.TunnelInfoForDevice
+
+// chooseTunnel decides WHERE the phone's tunnel is: ask the tunnel itself first,
+// and fall back to the address pinned at launch only when it will not answer.
+//
+// It used to be the other way round. phone-bridge.sh exports COAGENT_PHONE_ADDR
+// and COAGENT_PHONE_RSD when it starts this process, and with those set the live
+// lookup was never made. But unplugging and replugging the phone gives the
+// tunnel a NEW address and port, so the bridge kept dialling the dead one until
+// somebody reran the script: "plug your phone back in" did not work on its own.
+// The pinned value still matters - the tunnel's info service is known to die
+// while the tunnel itself lives - so it stays, as the fallback it always was.
+func chooseTunnel(udid string, live tunnel.Tunnel, liveErr error, envAddr, envPort string) (tunnel.Tunnel, error) {
+	if liveErr == nil && live.Address != "" && live.RsdPort > 0 {
+		return live, nil
+	}
+	if envAddr != "" {
+		port, perr := strconv.Atoi(envPort)
+		if perr != nil {
+			return tunnel.Tunnel{}, fmt.Errorf("phone_tunnel_env_invalid")
+		}
+		return tunnel.Tunnel{Address: envAddr, RsdPort: port, Udid: udid}, nil
+	}
+	if liveErr != nil {
+		return tunnel.Tunnel{}, fmt.Errorf("phone_tunnel_down: %w", liveErr)
+	}
+	return tunnel.Tunnel{}, fmt.Errorf("phone_tunnel_down")
+}
+
+func main() {
+	token := strings.TrimSpace(os.Getenv("COAGENT_PHONE_TOKEN"))
+	if len(token) < 24 {
+		log.Fatal("COAGENT_PHONE_TOKEN (>=24 chars) is required")
+	}
+	addr := os.Getenv("COAGENT_PHONE_LISTEN")
+	if addr == "" {
+		addr = "127.0.0.1:8793"
+	}
+	if !strings.HasPrefix(addr, "127.0.0.1:") {
+		log.Fatal("loopback only")
+	}
+	b := &bridge{}
+	auth := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("authorization") != "Bearer "+token {
+				writeJSON(w, 401, map[string]any{"ok": false, "reason": "phone_bridge_unauthorized"})
+				return
+			}
+			h(w, r)
+		}
+	}
+	body := func(r *http.Request) map[string]any {
+		m := map[string]any{}
+		json.NewDecoder(http.MaxBytesReader(nil, r.Body, 4096)).Decode(&m)
+		return m
+	}
+	num := func(m map[string]any, k string) float64 {
+		v, ok := m[k].(float64)
+		if !ok {
+			return -1
+		}
+		return v
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", auth(func(w http.ResponseWriter, r *http.Request) {
+		// Always 200: the body IS the answer, and a caller that cannot read it
+		// learns nothing about which of the three capabilities died.
+		writeJSON(w, 200, b.probe())
+	}))
+	mux.HandleFunc("/screenshot", auth(func(w http.ResponseWriter, r *http.Request) {
+		var png []byte
+		err := b.withDevice(func(d ios.DeviceEntry) error {
+			ss, err := instruments.NewScreenshotService(d)
+			if err != nil {
+				return fmt.Errorf("phone_capture_failed: %w", err)
+			}
+			defer ss.Close()
+			shot, err := ss.TakeScreenshot()
+			if err != nil || len(shot) == 0 {
+				return fmt.Errorf("phone_capture_failed: %v", err)
+			}
+			png = shot
+			return nil
+		})
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		w.Header().Set("content-type", "image/png")
+		w.Write(png)
+	}))
+	mux.HandleFunc("/tap", auth(func(w http.ResponseWriter, r *http.Request) {
+		m := body(r)
+		x, y := num(m, "x"), num(m, "y")
+		if !unit(x) || !unit(y) {
+			writeJSON(w, 400, map[string]any{"ok": false, "reason": "phone_point_invalid"})
+			return
+		}
+		hold := 60 * time.Millisecond
+		if h := num(m, "holdMs"); h > 0 && h <= 3000 {
+			hold = time.Duration(h) * time.Millisecond
+		}
+		err := b.withHID(func(s *hid.Session) error {
+			if e := s.TouchDown(pt(x, y)); e != nil {
+				return e
+			}
+			time.Sleep(hold)
+			return s.TouchUp(pt(x, y))
+		})
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	}))
+	mux.HandleFunc("/swipe", auth(func(w http.ResponseWriter, r *http.Request) {
+		m := body(r)
+		x1, y1, x2, y2 := num(m, "x1"), num(m, "y1"), num(m, "x2"), num(m, "y2")
+		if !unit(x1) || !unit(y1) || !unit(x2) || !unit(y2) {
+			writeJSON(w, 400, map[string]any{"ok": false, "reason": "phone_point_invalid"})
+			return
+		}
+		ms := num(m, "durationMs")
+		if ms < 40 || ms > 3000 {
+			ms = 250
+		}
+		steps := int(ms / 8)
+		err := b.withHID(func(s *hid.Session) error {
+			for i := 0; i <= steps; i++ {
+				t := float64(i) / float64(steps)
+				if e := s.TouchDown(pt(x1+(x2-x1)*t, y1+(y2-y1)*t)); e != nil {
+					return e
+				}
+				time.Sleep(8 * time.Millisecond)
+			}
+			return s.TouchUp(pt(x2, y2))
+		})
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	}))
+	mux.HandleFunc("/launch", auth(func(w http.ResponseWriter, r *http.Request) {
+		m := body(r)
+		id, _ := m["bundleId"].(string)
+		if id == "" || len(id) > 200 {
+			writeJSON(w, 400, map[string]any{"ok": false, "reason": "phone_bundle_invalid"})
+			return
+		}
+		var pid uint64
+		err := b.withDevice(func(d ios.DeviceEntry) error {
+			pc, err := instruments.NewProcessControl(d)
+			if err != nil {
+				return fmt.Errorf("phone_launch_failed: %w", err)
+			}
+			defer pc.Close()
+			p, err := pc.LaunchApp(id, map[string]any{})
+			if err != nil {
+				return fmt.Errorf("phone_launch_failed: %w", err)
+			}
+			pid = p
+			return nil
+		})
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "pid": pid})
+	}))
+	mux.HandleFunc("/apps", auth(func(w http.ResponseWriter, r *http.Request) {
+		out, err := b.apps()
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "apps": out})
+	}))
+	log.Printf("coagent-phoned on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}
