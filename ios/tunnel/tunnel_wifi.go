@@ -125,15 +125,41 @@ func connectToTunnelOverRemotePairing(ctx context.Context, endpoint ios.RemotePa
 	// with a better message than anything that could be said here.
 	_ = conn.SetDeadline(time.Time{})
 
-	return connectToTunnelLockdown(ctx, device, tlsConn)
+	if dial == nil {
+		return connectToTunnelLockdown(ctx, device, tlsConn)
+	}
+	t, err := connectStreamedTunnelLockdown(ctx, device, tlsConn)
+	if err != nil {
+		// Give both stream slots back now rather than when the collector gets to them.
+		_ = tlsConn.Close()
+		_ = conn.Close()
+		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: %w", err)
+	}
+	return t, nil
+}
+
+// connectStreamedTunnelLockdown runs the CDTunnel data plane over a tunnel-port connection from
+// dialTunnelPortVia, which still carries the deadline that bounds its setup. The parameter exchange
+// runs under that deadline — a stream that completes TLS-PSK and then carries nothing must fail, not
+// hang — and the deadline is cleared once the parameters are in, before any packet is forwarded.
+func connectStreamedTunnelLockdown(ctx context.Context, device ios.DeviceEntry, tlsConn net.Conn) (Tunnel, error) {
+	return connectToTunnelLockdownThen(ctx, device, tlsConn, func() error {
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+			return fmt.Errorf("failed to clear the tunnel-port setup deadline: %w", err)
+		}
+		return nil
+	})
 }
 
 // dialTunnelPortVia opens the per-session TLS-PSK tunnel port through dial, at the same host the
 // control channel used, and runs the TLS-PSK handshake on it.
 //
-// Unlike the direct path, the handshake is bounded: over loopback streams the stream can open and
-// then never carry a byte (the phone's listener accepted and stalled, or the epoch is wedged), and an
-// unbounded handshake would hold the caller forever. The deadline is cleared once the handshake is in.
+// Unlike the direct path, the setup is bounded: over loopback streams the stream can open and then
+// never carry a byte (the phone's listener accepted and stalled, or the epoch is wedged), and an
+// unbounded read would hold the caller forever. The dial gets ios.TunnelDialTimeout; the TLS-PSK
+// handshake and the CDTunnel parameter exchange after it share a second ios.TunnelDialTimeout, set
+// here and LEFT ON the returned connection. connectStreamedTunnelLockdown clears it once the
+// parameters are in; any other caller must clear it before using the connection long-term.
 func dialTunnelPortVia(ctx context.Context, dial RemotePairingDialer, host string, port uint16, psk []byte) (net.Conn, error) {
 	tunnelAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	dctx, cancel := context.WithTimeout(ctx, ios.TunnelDialTimeout)
@@ -154,10 +180,6 @@ func dialTunnelPortVia(ctx context.Context, dial RemotePairingDialer, host strin
 	if err != nil {
 		// tlspsk.Client has already closed raw.
 		return nil, fmt.Errorf("TLS-PSK handshake on %s failed: %w", tunnelAddr, err)
-	}
-	if err := raw.SetDeadline(time.Time{}); err != nil {
-		_ = tlsConn.Close()
-		return nil, fmt.Errorf("failed to clear the TLS-PSK handshake deadline on %s: %w", tunnelAddr, err)
 	}
 	return tlsConn, nil
 }

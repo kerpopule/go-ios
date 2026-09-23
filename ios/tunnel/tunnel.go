@@ -38,11 +38,34 @@ type Tunnel struct {
 	UserspaceTUN     bool `json:"userspaceTun"`
 	UserspaceTUNPort int  `json:"userspaceTunPort"`
 	closer           func() error
+	// ended reports the end of a tunnel whose forwarding can stop on its own (the lockdown
+	// CoreDeviceProxy data plane and every road built on it). nil for tunnels that do not report it.
+	ended *tunnelEnd
 }
 
 // Close closes the connection to the device and removes the virtual network interface from the host
 func (t Tunnel) Close() error {
 	return t.closer()
+}
+
+// Done is closed when the tunnel has stopped carrying packets on its own — the connection to the
+// device ended or the interface failed — or once Close is called. A process that holds a tunnel open
+// under a supervisor selects on it so that it exits instead of sitting on a dead interface. It is nil,
+// and so never ready, for a tunnel that does not report its end.
+func (t Tunnel) Done() <-chan struct{} {
+	if t.ended == nil {
+		return nil
+	}
+	return t.ended.done
+}
+
+// Err says why the tunnel ended: the first forwarding error. It is nil while the tunnel is up, after
+// Close, and for a tunnel that does not report its end.
+func (t Tunnel) Err() error {
+	if t.ended == nil {
+		return nil
+	}
+	return t.ended.reason()
 }
 
 // ManualPairAndConnectToTunnel tries to verify an existing pairing, and if this fails it triggers a new manual pairing process.

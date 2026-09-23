@@ -237,3 +237,37 @@ func TestWithViaKeepsTheTunnelFields(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// Contract §9, Lifetime: a streams tunnel that dies must end the process, or the daemon supervising it
+// never re-runs it. The hold returns on the tunnel's end as well as on a signal.
+func TestHoldStreamsTunnelReturnsWhenTheTunnelEnds(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	if !holdStreamsTunnel(make(chan os.Signal), done) {
+		t.Fatal("a tunnel that ended must end the hold as 'ended'")
+	}
+	signals := make(chan os.Signal, 1)
+	signals <- os.Interrupt
+	if holdStreamsTunnel(signals, nil) {
+		t.Fatal("a signal is a requested stop, not a tunnel end")
+	}
+}
+
+func TestTunnelEndedLineShape(t *testing.T) {
+	out := tunnelEndedLine(fmt.Errorf("forwarding from the device stopped: %w", io.EOF))
+	if out["ok"] != false || out["reason"] != "tunnel_ended" || out["via"] != "streams" || out["streams"] != "opened" {
+		t.Fatalf("got %v", out)
+	}
+	msg, _ := out["error"].(string)
+	if !strings.Contains(msg, "EOF") || !strings.Contains(msg, "run tunnel again") {
+		t.Fatalf("error %q should carry the data plane's reason and what to do", msg)
+	}
+	for _, k := range []string{"rep", "leg", "target"} {
+		if _, has := out[k]; has {
+			t.Fatalf("every stream had opened; %q does not apply: %v", k, out)
+		}
+	}
+	if out := tunnelEndedLine(nil); out["reason"] != "tunnel_ended" || out["streams"] != "opened" {
+		t.Fatalf("with no reason recorded: %v", out)
+	}
+}

@@ -71,21 +71,32 @@ func VerifyRemotePairing(address string, timeout time.Duration, p PairRecordMana
 }
 
 // VerifyRemotePairingVia is VerifyRemotePairing with the control channel opened by dial (for example
-// StreamsDialer) instead of a direct TCP connect. timeout bounds the dial and the exchange together.
-// A nil dial is exactly VerifyRemotePairing.
+// StreamsDialer) instead of a direct TCP connect. With a dial, timeout is ONE budget for the whole
+// call: the stream's open (which the desk can legitimately hold for most of it) and the pair-verify
+// exchange share it, so a caller can wrap the verify probe in timeout plus a little slack.
+//
+// A nil dial is exactly VerifyRemotePairing, whose bound is unchanged: the TCP connect gets timeout
+// and the exchange then gets its own timeout.
 func VerifyRemotePairingVia(address string, timeout time.Duration, p PairRecordManager, dial RemotePairingDialer) error {
 	var conn *rpPairingConn
 	var err error
+	var deadline time.Time
 	if dial == nil {
 		conn, err = dialRemotePairing(address, timeout)
 	} else {
-		conn, err = dialRemotePairingVia(context.Background(), dial, address, timeout, StreamsLegControl)
+		deadline = time.Now().Add(timeout)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		conn, err = dialRemotePairingVia(ctx, dial, address, timeout, StreamsLegControl)
+		cancel()
 	}
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if dial == nil {
+		deadline = time.Now().Add(timeout)
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
 		return fmt.Errorf("VerifyRemotePairing: failed to bound the exchange: %w", err)
 	}
 	ts := newTunnelServiceWithXpc(conn, conn, p)

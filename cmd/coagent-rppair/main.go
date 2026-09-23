@@ -25,7 +25,8 @@
 //	    unix socket. Both the control channel and the TLS-PSK tunnel port go through SOCK. --at is
 //	    optional and must be phone:PORT or 127.0.0.1:PORT, PORT in 49152-65535.
 //
-// Every result is one JSON line: {"ok":true,...} or {"ok":false,"reason":...,"error":...}.
+// Every result is one JSON line: {"ok":true,...} or {"ok":false,"reason":...,"error":...}. The one
+// exception is a streams tunnel that came up and later died, which adds a second line (see below).
 //
 // With --via-streams, success gains "via":"streams" (for tunnel, on each tunnel object), and failure
 // keeps its reason and adds "via":"streams" plus "streams":<word>:
@@ -39,6 +40,16 @@
 // usually means the relay epoch ended mid-exchange. A --at the streams road cannot reach fails with
 // reason "via_streams_bad_target". The phone's own reason for a refusal is in the desk peer's
 // tunnel-peer-status.json, streams.lastFailure.
+//
+// Bounds on the streams road: verify finishes within --timeout (the stream's open and the pair-verify
+// exchange share it). tunnel gives the control channel 30 s to open and 30 s for its handshake, and
+// the tunnel port 15 s to open and 15 s for TLS-PSK plus the CDTunnel parameter exchange.
+//
+// A streams tunnel does not outlive the relay epoch. When its data plane stops (the desk closes every
+// stream at an epoch end) `tunnel --via-streams` removes its interface, prints a SECOND line
+// {"ok":false,"reason":"tunnel_ended","via":"streams","streams":"opened","error":...} and exits 1, so a
+// supervisor sees the exit and runs it again. Without --via-streams, tunnel holds until a signal, as
+// it always has.
 package main
 
 import (
@@ -103,6 +114,28 @@ func failStreams(reason string, err error) {
 	os.Exit(1)
 }
 
+// holdStreamsTunnel waits until a signal asks this process to stop (false) or the tunnel stops on its
+// own (true).
+func holdStreamsTunnel(signals <-chan os.Signal, done <-chan struct{}) bool {
+	select {
+	case <-signals:
+		return false
+	case <-done:
+		return true
+	}
+}
+
+// tunnelEndedLine is the second JSON line of a streams tunnel that came up and then died. Every stream
+// had opened, so "streams" is "opened"; the error is the data plane's own reason.
+func tunnelEndedLine(reason error) map[string]any {
+	msg := "the tunnel stopped carrying packets"
+	if reason != nil {
+		msg += ": " + reason.Error()
+	}
+	msg += " — on the streams road this is usually the relay epoch ending (a Wi-Fi<->cellular change or a desk peer restart); run tunnel again"
+	return streamsFailure("tunnel_ended", errors.New(msg))
+}
+
 // withVia marks each tunnel object with the road it came up on, keeping the `ios tunnel ls` fields.
 func withVia(tunnels []tunnel.Tunnel, via string) []map[string]any {
 	out := make([]map[string]any, 0, len(tunnels))
@@ -144,7 +177,7 @@ func main() {
 	at := fs.String("at", "", "RemotePairing HOST:PORT, e.g. 10.71.0.2:49152 (verify, tunnel)")
 	udid := fs.String("udid", "", "phone UDID")
 	dir := fs.String("records", "", "pair record directory")
-	timeout := fs.Duration("timeout", 15*time.Second, "verify timeout")
+	timeout := fs.Duration("timeout", 15*time.Second, "verify timeout (with --via-streams: the whole verify, stream open included)")
 	viaStreams := fs.String("via-streams", "", "desk peer loopback-streams SOCKS5 unix socket (verify, tunnel)")
 	_ = fs.Parse(os.Args[2:])
 	if *dir == "" {
@@ -218,7 +251,18 @@ func main() {
 		fmt.Println(string(info))
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-		<-signals
+		if *viaStreams == "" {
+			<-signals
+			return
+		}
+		// Contract §9, Lifetime: a streams tunnel dies with the relay epoch (every Wi-Fi<->cellular
+		// change, every peer restart), and the daemon re-runs this when it exits. So it must exit.
+		if holdStreamsTunnel(signals, t.Done()) {
+			reason := t.Err()
+			_ = t.Close()
+			emit(tunnelEndedLine(reason))
+			os.Exit(1)
+		}
 	default:
 		fail("unknown command "+cmd, nil)
 	}
