@@ -127,3 +127,34 @@ func TestNewWithShimConnectionNeedsTheShimInRsd(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), ShimServiceName)
 }
+
+// ReturnAttributes rides in ClientOptions next to what BrowseUserApps and
+// BrowseSystemApps already send, and asking for nothing sends the plain request.
+func TestBrowseWithAttributesAsksForOnlyThoseKeys(t *testing.T) {
+	port, got := fakeInstallProxyShim(t)
+	conn, err := NewWithShimConnection(shimDevice(port))
+	require.NoError(t, err)
+	defer conn.Close()
+	<-got
+
+	keys := []string{"CFBundleIdentifier", "CFBundleName"}
+	_, err = conn.BrowseUserAppsWithAttributes(keys)
+	require.NoError(t, err)
+	opts, _ := (<-got)["ClientOptions"].(map[string]any)
+	assert.Equal(t, "User", opts["ApplicationType"])
+	assert.Equal(t, true, opts["ShowLaunchProhibitedApps"])
+	assert.Equal(t, []any{"CFBundleIdentifier", "CFBundleName"}, opts["ReturnAttributes"])
+
+	_, err = conn.BrowseSystemAppsWithAttributes(keys)
+	require.NoError(t, err)
+	opts, _ = (<-got)["ClientOptions"].(map[string]any)
+	assert.Equal(t, "System", opts["ApplicationType"])
+	assert.Nil(t, opts["ShowLaunchProhibitedApps"])
+	assert.Equal(t, []any{"CFBundleIdentifier", "CFBundleName"}, opts["ReturnAttributes"])
+
+	_, err = conn.BrowseUserAppsWithAttributes(nil)
+	require.NoError(t, err)
+	opts, _ = (<-got)["ClientOptions"].(map[string]any)
+	_, has := opts["ReturnAttributes"]
+	assert.False(t, has, "no keys must send the plain Browse")
+}

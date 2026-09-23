@@ -37,12 +37,15 @@ const (
 func noMuxMode(t *testing.T, pin noMuxPin) {
 	t.Helper()
 	oldPin, oldResolve, oldList, oldApps, oldInfo := noMux, resolve, listDevices, listApps, tunnelInfoForDevice
-	oldLockdown, oldShim, oldHS := probeLockdown, probeShim, handshakeNoMux
+	oldLockdown, oldShim, oldHS, oldAlive := probeLockdown, probeShim, handshakeNoMux, tunnelAlive
 	t.Cleanup(func() {
 		noMux, resolve, listDevices, listApps, tunnelInfoForDevice = oldPin, oldResolve, oldList, oldApps, oldInfo
-		probeLockdown, probeShim, handshakeNoMux = oldLockdown, oldShim, oldHS
+		probeLockdown, probeShim, handshakeNoMux, tunnelAlive = oldLockdown, oldShim, oldHS, oldAlive
 	})
 	useNoMux(pin)
+	// The stand-in tunnel (the fake shim on loopback) has nothing on its RSD
+	// port, so the liveness test answers "alive" unless a test says otherwise.
+	tunnelAlive = func(string, int, time.Duration) error { return nil }
 	listDevices = func() (ios.DeviceList, error) {
 		t.Fatal("no-mux mode consulted usbmux")
 		return ios.DeviceList{}, nil
@@ -126,12 +129,22 @@ const (
 	shimRefuses                          // answers the checkin with an Error
 	shimWedgedList                       // checks in, then never answers Browse
 	shimWedgedCheck                      // accepts, never answers the checkin
+	shimFlakyOnce                        // drops the first connection mid-checkin, then is healthy
 )
 
 // fakeAppsShim serves the device side of com.apple.mobile.installation_proxy.
 // shim.remote on loopback and counts the connections it accepted.
 func fakeAppsShim(t *testing.T, how shimBehaviour) (port int, accepted *atomic.Int32) {
 	t.Helper()
+	port, accepted, _ = fakeAppsShimRecording(t, how)
+	return port, accepted
+}
+
+// fakeAppsShimRecording is fakeAppsShim that also hands every Browse request
+// it read to browses.
+func fakeAppsShimRecording(t *testing.T, how shimBehaviour) (port int, accepted *atomic.Int32, browses chan map[string]any) {
+	t.Helper()
+	browses = make(chan map[string]any, 16)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -144,11 +157,14 @@ func fakeAppsShim(t *testing.T, how shimBehaviour) (port int, accepted *atomic.I
 			if err != nil {
 				return
 			}
-			accepted.Add(1)
+			n := accepted.Add(1)
 			go func(c net.Conn) {
 				defer c.Close()
 				req, err := shimUnframe(c)
 				if err != nil || req["Request"] != "RSDCheckin" {
+					return
+				}
+				if how == shimFlakyOnce && n == 1 {
 					return
 				}
 				switch how {
@@ -167,6 +183,10 @@ func fakeAppsShim(t *testing.T, how shimBehaviour) (port int, accepted *atomic.I
 					req, err := shimUnframe(c)
 					if err != nil {
 						return
+					}
+					select {
+					case browses <- req:
+					default:
 					}
 					if how == shimWedgedList {
 						io.Copy(io.Discard, c)
@@ -188,7 +208,7 @@ func fakeAppsShim(t *testing.T, how shimBehaviour) (port int, accepted *atomic.I
 			}(c)
 		}
 	}()
-	return ln.Addr().(*net.TCPAddr).Port, accepted
+	return ln.Addr().(*net.TCPAddr).Port, accepted, browses
 }
 
 // --- the switch -------------------------------------------------------------
@@ -276,8 +296,8 @@ func TestNoMuxResolveRefusesAnotherPhone(t *testing.T) {
 	noMuxMode(t, defaultPin())
 	stubNoMuxHandshake(t, fullRsd, "00008150-0000000000000000")
 	_, err := resolve()
-	if err == nil || reasonOf(err) != reasonWrongDevice {
-		t.Fatalf("wanted %s, got %v", reasonWrongDevice, err)
+	if err == nil || reasonOf(err) != reasonDeviceFailed || !errors.Is(err, errWrongDevice) {
+		t.Fatalf("wanted %s (%s), got %v", reasonDeviceFailed, causeWrongDevice, err)
 	}
 	if !strings.Contains(err.Error(), testUDID) || !strings.Contains(err.Error(), "00008150-0000000000000000") {
 		t.Fatalf("the detail must name both phones: %v", err)
@@ -444,11 +464,14 @@ func TestNoMuxProbeWithoutTheShimKeepsSeeAndAct(t *testing.T) {
 	if !st.See.up() || !st.Act.up() {
 		t.Fatalf("see/act must come up without the shim, got %+v", st)
 	}
-	if st.Apps.State != capDown || st.Apps.Reason != reasonAppsRemoteUnavailable || st.Apps.Proof != proofRSD {
-		t.Fatalf("wanted apps down/%s proven by the table, got %+v", reasonAppsRemoteUnavailable, st.Apps)
+	if st.Apps.State != capDown || st.Apps.Reason != reasonAppsUnreadable || st.Apps.Proof != proofRSD {
+		t.Fatalf("wanted apps down/%s proven by the table, got %+v", reasonAppsUnreadable, st.Apps)
 	}
-	if st.OK || st.Reason != reasonAppsRemoteUnavailable {
-		t.Fatalf("wanted ok=false reason=%s, got %+v", reasonAppsRemoteUnavailable, st)
+	if !strings.HasPrefix(st.Apps.Detail, reasonAppsUnreadable+": "+causeAppsRemoteUnavailable+": ") {
+		t.Fatalf("the precise cause must lead the detail: %q", st.Apps.Detail)
+	}
+	if st.OK || st.Reason != reasonAppsUnreadable {
+		t.Fatalf("wanted ok=false reason=%s, got %+v", reasonAppsUnreadable, st)
 	}
 }
 
@@ -487,7 +510,8 @@ func TestNoMuxProbeBoundsAWedgedShim(t *testing.T) {
 }
 
 // One tunnel carries everything, so when it does not answer all three are down
-// for that one reason, no UDID is claimed, and the probe condemns nothing.
+// for that one reason and no UDID is claimed. And because the gesture session
+// rides that same tunnel, the probe condemns it (see probeNoMux).
 func TestNoMuxProbeWithTheTunnelDown(t *testing.T) {
 	noMuxMode(t, defaultPin())
 	h := stubNoMuxHandshake(t, fullRsd, testUDID)
@@ -502,8 +526,8 @@ func TestNoMuxProbeWithTheTunnelDown(t *testing.T) {
 	if st.OK || st.UDID != "" || st.Reason != "phone_tunnel_unreachable" {
 		t.Fatalf("got %+v", st)
 	}
-	if b.stale.Load() {
-		t.Fatal("a /status poll condemned the gesture session")
+	if !b.stale.Load() {
+		t.Fatal("the tunnel the gesture session rides did not answer; the session must be condemned")
 	}
 }
 
@@ -511,8 +535,11 @@ func TestNoMuxProbeWithAnotherPhoneClaimsNothing(t *testing.T) {
 	noMuxMode(t, defaultPin())
 	stubNoMuxHandshake(t, fullRsd, "00008150-0000000000000000")
 	st := (&bridge{}).probe()
-	if st.OK || st.UDID != "" || st.See.up() || st.Apps.Reason != reasonWrongDevice || st.Reason != reasonWrongDevice {
-		t.Fatalf("wanted everything down/%s and no udid, got %+v", reasonWrongDevice, st)
+	if st.OK || st.UDID != "" || st.See.up() || st.Apps.Reason != reasonDeviceFailed || st.Reason != reasonDeviceFailed {
+		t.Fatalf("wanted everything down/%s and no udid, got %+v", reasonDeviceFailed, st)
+	}
+	if !strings.Contains(st.Detail, causeWrongDevice) {
+		t.Fatalf("the detail must name the cause: %q", st.Detail)
 	}
 }
 
@@ -577,12 +604,12 @@ func TestNoMuxStatusBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	detail := "phone_apps_unavailable_remote: com.apple.mobile.installation_proxy.shim.remote is not in the phone's RSD service table"
+	detail := "phone_apps_unreadable: phone_apps_unavailable_remote: com.apple.mobile.installation_proxy.shim.remote is not in the phone's RSD service table"
 	want := `{"ok":false,"udid":"` + testUDID + `",` +
 		`"see":{"state":"up","proof":"rsd_service_table"},` +
 		`"act":{"state":"up","proof":"rsd_service_table"},` +
-		`"apps":{"state":"down","proof":"rsd_service_table","reason":"phone_apps_unavailable_remote","detail":"` + detail + `"},` +
-		`"reason":"phone_apps_unavailable_remote","detail":"` + detail + `"}`
+		`"apps":{"state":"down","proof":"rsd_service_table","reason":"phone_apps_unreadable","detail":"` + detail + `"},` +
+		`"reason":"phone_apps_unreadable","detail":"` + detail + `"}`
 	if string(raw) != want {
 		t.Fatalf("no-mux status body\n got: %s\nwant: %s", raw, want)
 	}
@@ -619,8 +646,8 @@ func TestNoMuxAppsWithoutTheShimSaysSo(t *testing.T) {
 	noMuxMode(t, defaultPin())
 	stubNoMuxHandshake(t, fullRsd, testUDID)
 	_, err := (&bridge{}).apps()
-	if err == nil || reasonOf(err) != reasonAppsRemoteUnavailable {
-		t.Fatalf("wanted %s, got %v", reasonAppsRemoteUnavailable, err)
+	if err == nil || reasonOf(err) != reasonAppsUnreadable || !errors.Is(err, errShimNotListed) {
+		t.Fatalf("wanted %s (%s), got %v", reasonAppsUnreadable, causeAppsRemoteUnavailable, err)
 	}
 }
 
@@ -661,7 +688,7 @@ func TestNoMuxAppsFailureLeavesTheGestureSessionAlone(t *testing.T) {
 func TestNoMuxReasonsAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
 	for _, r := range []string{reasonNotConnected, reasonMuxUnreachable, reasonAppsUnreadable, reasonAppsFailed,
-		reasonAppsUnprobed, reasonWrongDevice, reasonAppsRemoteUnavailable, reasonTunnelEnvInvalid, reasonNoMux,
+		reasonAppsUnprobed, reasonDeviceFailed, causeWrongDevice, causeAppsRemoteUnavailable, reasonTunnelEnvInvalid, reasonNoMux,
 		"phone_tunnel_unreachable", "phone_handshake_failed", "phone_tunnel_down"} {
 		if seen[r] {
 			t.Fatalf("reason %q is used for two different states", r)

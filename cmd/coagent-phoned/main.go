@@ -36,6 +36,14 @@
 // agent are never asked. The switch is read once in main(), never at call
 // time, so a developer shell with it exported cannot flip the unit tests.
 // The /status wire shape is the same in both modes.
+//
+// Over the relay the tunnel can die while its utun stays up ("black-holed"),
+// so in no-mux mode every route is bounded as a whole to fit the daemon's
+// 20 s (see the budgets), a cached device or a ready gesture session is reused
+// only after the tunnel is shown to answer, and a failed /status handshake
+// condemns the gesture session. Reasons the installed daemon does not know are
+// reported under the nearest one it does, with the precise cause in the detail
+// (see the causes).
 package main
 
 import (
@@ -87,10 +95,35 @@ const (
 	reasonAppsUnprobed   = "phone_apps_unprobed"       // the lockdown probe is switched off: nothing was established
 
 	// No-mux mode only.
-	reasonWrongDevice           = "phone_wrong_device"            // the tunnel answers, but as a different phone than COAGENT_PHONE_UDID
-	reasonAppsRemoteUnavailable = "phone_apps_unavailable_remote" // the phone's RSD table does not list the installation_proxy shim
-	reasonTunnelEnvInvalid      = "phone_tunnel_env_invalid"      // the no-mux switch or its tunnel pin will not parse
-	reasonNoMux                 = "phone_no_mux"                  // something tried to read usbmux in no-mux mode (a bug, never a phone state)
+	reasonDeviceFailed     = "phone_device_failed"      // the pinned tunnel answers as another phone (cause: causeWrongDevice)
+	reasonTunnelEnvInvalid = "phone_tunnel_env_invalid" // the no-mux switch or its tunnel pin will not parse
+	reasonNoMux            = "phone_no_mux"             // something tried to read usbmux in no-mux mode (a bug, never a phone state)
+)
+
+// Causes: no-mux states the installed daemon has no word for. Co-Agent 0.5.67
+// turns any reason missing from its PHONE_REASONS list into phone_bridge_error
+// ("an error it could not name"), in /apps answers and in the top-level /status
+// reason alike, and that daemon cannot be changed from here. So each of these
+// is reported under the nearest reason the daemon DOES know, whose words and
+// road handling fit it, and the precise cause leads the detail, where the logs
+// and a later daemon can still tell it apart:
+//
+//	phone_device_failed: phone_wrong_device: the tunnel at ... answers as X, not Y
+//	  (a road reason: the daemon re-measures the road and restarts the bridge,
+//	  which re-pins the tunnel; the words say the bridge lost the phone)
+//	phone_apps_unreadable: phone_apps_unavailable_remote: ... is not in the phone's RSD service table
+//	  (the words say sight and touch work but the app list cannot be read)
+const (
+	causeWrongDevice           = "phone_wrong_device"            // the tunnel answers, but as a different phone than COAGENT_PHONE_UDID
+	causeAppsRemoteUnavailable = "phone_apps_unavailable_remote" // the phone's RSD table does not list the installation_proxy shim
+)
+
+var (
+	errWrongDevice   = errors.New(causeWrongDevice)
+	errShimNotListed = errors.New(causeAppsRemoteUnavailable)
+	// errAppsDeadline: the app listing ran out of time. Re-asking the same
+	// pinned tunnel is no faster, so it is never retried.
+	errAppsDeadline = errors.New("no complete app list")
 )
 
 // reasonMuxUnreachable replaced an earlier reason string, phone_list_failed,
@@ -120,15 +153,34 @@ const (
 // seconds-old answer is still an answer the phone actually gave.
 var appsProbeTTL = 5 * time.Second
 
-// No-mux budgets. The bridge gives a /status call 12 s and the daemon gives
-// every route 20 s, so each step over the relay tunnel is bounded well inside
-// those: a handshake, then (for /status) one shim checkin, or (for /apps) a
-// checkin plus the listing.
+// No-mux budgets. The bridge gives a /status call 12 s and the installed daemon
+// aborts every route at 20 s (PhoneDeviceBridge timeoutMs), after which the
+// user hears "locked or asleep" whatever really failed. So it is each whole
+// ROUTE over the relay tunnel that must fit, not each step:
+//
+//	/status  handshake 6 + shim checkin 4                              = 10 s
+//	/apps    one appsBudget deadline covers the device, the checkin, the
+//	         listing and the one retry allowed                         <= 17 s
+//	read     tunnel already dead: liveness 2 + handshake 6             =  8 s
+//	         dies mid-call: service dial 5 + re-resolve handshake 6    = 11 s (+ liveness)
+//	gesture  tunnel dead: liveness 2 + stream stop 2 + handshake 6     = 10 s
 var (
 	noMuxHandshakeTimeout = 6 * time.Second
 	shimCheckinTimeout    = 4 * time.Second
-	shimListTimeout       = 15 * time.Second
+	shimListTimeout       = 15 * time.Second // one listing, at most
+	appsBudget            = 17 * time.Second // one whole /apps request
+	appsRetryListing      = 2 * time.Second  // the least listing time a retry must still have
+	noMuxDialTimeout      = 5 * time.Second  // every service dial (DTX, display, HID) over the pinned tunnel
+
+	// The liveness test: a TCP connect to the RSD port, as the bridge's keeper
+	// does. A proof younger than liveProofTTL is trusted without a new connect.
+	liveCheckTimeout = 2 * time.Second
+	liveProofTTL     = 3 * time.Second
 )
+
+// streamStopTimeout bounds the video-stream stop in teardown, in both modes: a
+// dead tunnel never answers it, and teardown runs under mu.
+var streamStopTimeout = 2 * time.Second
 
 // Environment for no-mux mode. Read once, in main(), by parseNoMux.
 const (
@@ -184,12 +236,12 @@ func parseNoMux(getenv func(string) string) (noMuxPin, error) {
 }
 
 // useNoMux switches the process into no-mux mode: the device comes from the
-// pinned tunnel, the app list rides the RSD shim, and the usbmux seam refuses.
+// pinned tunnel, the usbmux seam refuses, and apps() (which checks the switch)
+// lists over the RSD shim under one deadline.
 func useNoMux(pin noMuxPin) {
 	pin.on = true
 	noMux = pin
 	resolve = resolveNoMux
-	listApps = listAppsShim
 	listDevices = func() (ios.DeviceList, error) {
 		return ios.DeviceList{}, fmt.Errorf("%s: usbmux is not consulted on this road", reasonNoMux)
 	}
@@ -266,12 +318,34 @@ var (
 		c.Close()
 		return nil
 	}
+
+	// tunnelAlive is the no-mux liveness test, the same one the bridge's keeper
+	// runs: a TCP connect to the RSD port on the pinned tunnel, closed at once.
+	// It starts no service and costs the phone one SYN. It exists because a
+	// black-holed tunnel (utun still up, nobody answering) is otherwise found
+	// only by a 15 s service dial, and a HID report, which expects no reply,
+	// is "sent" into it without any error at all.
+	tunnelAlive = func(addr string, port int, timeout time.Duration) error {
+		c, err := ios.DialTunnelTCPWithTimeout(net.JoinHostPort(addr, strconv.Itoa(port)), timeout)
+		if err != nil {
+			return fmt.Errorf("phone_tunnel_unreachable: [%s]:%d did not accept a connection: %w", addr, port, err)
+		}
+		c.Close()
+		return nil
+	}
+
+	// stopStream stops the video stream and closes the display service. The
+	// stop honours ctx (display closes its connection when ctx ends).
+	stopStream = func(ctx context.Context, svc *display.Service, id uuid.UUID) {
+		svc.StopMediaStream(ctx, id)
+		svc.Close()
+	}
 )
 
 // shimListed: does this device's RSD table offer the installation_proxy shim?
 func shimListed(d ios.DeviceEntry) error {
 	if d.Rsd == nil || d.Rsd.GetPort(svcAppsShim) == 0 {
-		return fmt.Errorf("%s: %s is not in the phone's RSD service table", reasonAppsRemoteUnavailable, svcAppsShim)
+		return fmt.Errorf("%s: %w: %s is not in the phone's RSD service table", reasonAppsUnreadable, errShimNotListed, svcAppsShim)
 	}
 	return nil
 }
@@ -290,7 +364,7 @@ func logShimListing(p ios.RsdPortProvider) {
 		if now == 1 {
 			log.Printf("no-mux: RSD lists %s on port %d", svcAppsShim, port)
 		} else {
-			log.Printf("no-mux: RSD does not list %s; /apps will report %s", svcAppsShim, reasonAppsRemoteUnavailable)
+			log.Printf("no-mux: RSD does not list %s; /apps will report %s (%s)", svcAppsShim, reasonAppsUnreadable, causeAppsRemoteUnavailable)
 		}
 	}
 }
@@ -316,6 +390,11 @@ type bridge struct {
 	// cannot take mu (see above), so this is how it tells the gesture side to
 	// rebuild instead of driving a dead session.
 	stale atomic.Bool
+
+	// No-mux only: when the pinned tunnel last proved it answers (unix nanos;
+	// 0 = never). Set by a handshake, a started session or a liveness connect.
+	// A HID write proves nothing: it expects no reply.
+	aliveAt atomic.Int64
 
 	// What the app-list channel last did, and when. Filled by the /status
 	// probe and by every real /apps call, so the two answer each other.
@@ -423,7 +502,7 @@ func resolveNoMux() (ios.DeviceEntry, error) {
 		return d, err
 	}
 	if pin.udid != "" && !strings.EqualFold(udid, pin.udid) {
-		return d, fmt.Errorf("%s: the tunnel at [%s]:%d answers as %s, not %s", reasonWrongDevice, pin.addr, pin.rsd, udid, pin.udid)
+		return d, fmt.Errorf("%s: %w: the tunnel at [%s]:%d answers as %s, not %s", reasonDeviceFailed, errWrongDevice, pin.addr, pin.rsd, udid, pin.udid)
 	}
 	logShimListing(p)
 	d.Properties.SerialNumber = udid
@@ -452,8 +531,12 @@ func (b *bridge) teardown() {
 		b.hid = nil
 	}
 	if b.svc != nil {
-		b.svc.StopMediaStream(context.Background(), b.stream)
-		b.svc.Close()
+		// Bounded: this used to wait with context.Background(), and over a dead
+		// or black-holed tunnel the device never answers, so a rebuild held mu
+		// (every gesture) until TCP keepalive gave up on the connection.
+		ctx, cancel := context.WithTimeout(context.Background(), streamStopTimeout)
+		stopStream(ctx, b.svc, b.stream)
+		cancel()
 		b.svc = nil
 	}
 	if b.recv != nil {
@@ -484,10 +567,34 @@ func (b *bridge) dropDevice() {
 func (b *bridge) markStale() { b.stale.Store(true) }
 
 // invalidate is both: the cached device is wrong AND the session built on it is
-// dead. Use it only where the device identity itself changed or vanished.
+// dead. Use it only where the device identity itself changed or vanished — or,
+// in no-mux mode, where the one tunnel every session rides stopped answering.
 func (b *bridge) invalidate() {
 	b.dropDevice()
 	b.markStale()
+}
+
+// sawTunnel records that the pinned tunnel just answered. Only no-mux mode
+// reads it (tunnelAnswers).
+func (b *bridge) sawTunnel() { b.aliveAt.Store(time.Now().UnixNano()) }
+
+// tunnelAnswers: in no-mux mode, did the pinned tunnel answer within
+// liveProofTTL, or does it accept a connection now (bounded by
+// liveCheckTimeout)? Always true in usbmux mode, where the usbmux re-checks
+// (cacheLive, appsEntry) are what catch a phone that went away.
+func (b *bridge) tunnelAnswers() bool {
+	if !noMux.on {
+		return true
+	}
+	if at := b.aliveAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < liveProofTTL {
+		return true
+	}
+	if err := tunnelAlive(noMux.addr, noMux.rsd, liveCheckTimeout); err != nil {
+		log.Printf("no-mux: %v", err)
+		return false
+	}
+	b.sawTunnel()
+	return true
 }
 
 // ensure brings up device + video stream + HID. Caller holds mu.
@@ -539,6 +646,7 @@ func (b *bridge) ensure() error {
 	}
 	b.hid = s
 	b.ready = true
+	b.sawTunnel()
 	b.devMu.Lock()
 	b.devCopy, b.devReady = d, true
 	b.devMu.Unlock()
@@ -550,9 +658,17 @@ func pt(x, y float64) hid.Point { return hid.Point{X: uint16(x * 65535), Y: uint
 func unit(v float64) bool { return v >= 0 && v <= 1 }
 
 // withHID runs fn once, and on failure rebuilds the session and retries once.
+//
+// In no-mux mode a ready session is reused only after the tunnel it rides is
+// shown to answer (tunnelAnswers). HID reports expect no reply and a small
+// write into a black-holed tunnel succeeds, so without this a tap after the
+// relay died answered {"ok":true} for as long as this process lived.
 func (b *bridge) withHID(fn func(*hid.Session) error) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.ready && !b.stale.Load() && !b.tunnelAnswers() {
+		b.invalidate()
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := b.ensure(); err != nil {
 			return err
@@ -574,12 +690,13 @@ func (b *bridge) withHID(fn func(*hid.Session) error) error {
 // itself will not answer we have not DISPROVED the cache, so we keep it: the
 // tunnel routes may well still work and guessing "gone" would be its own lie.
 //
-// In no-mux mode there is no local list to check against, so the cache is
-// trusted as long as it belongs to the pinned tunnel (address and, because the
-// pin is fixed for the process, its RSD port). A dead tunnel is still caught:
-// withDevice's retry re-resolves, and a failed re-resolve condemns the
-// session. Consulting usbmux here instead would find nothing and throw the
-// gesture session away on every call.
+// In no-mux mode there is no local list to check against, so this only asks
+// whether the entry belongs to the pinned tunnel (address and, because the pin
+// is fixed for the process, its RSD port). Consulting usbmux here instead would
+// find nothing and throw the gesture session away on every call. Whether that
+// tunnel still ANSWERS is device()'s second question (tunnelAnswers): trusting
+// it blind made a read on a black-holed tunnel pay the full service dial and
+// then a re-handshake, about 21 s, past the daemon's 20 s.
 func cacheLive(d ios.DeviceEntry) bool {
 	if noMux.on {
 		return d.Address == noMux.addr && d.Rsd != nil && d.Properties.SerialNumber != ""
@@ -595,13 +712,15 @@ func cacheLive(d ios.DeviceEntry) bool {
 // device returns a device for the tunnel routes. The cache is never trusted
 // blind: it is re-checked against usbmuxd on this Mac first, which is a unix
 // socket round trip to a local daemon and never reaches the phone, so it can
-// never wake or interrupt it.
+// never wake or interrupt it. In no-mux mode it is re-checked against the
+// pinned tunnel instead: a TCP connect to its RSD port, at most once per
+// liveProofTTL, which likewise starts nothing on the phone.
 func (b *bridge) device() (ios.DeviceEntry, error) {
 	b.devMu.RLock()
 	d, cached := b.devCopy, b.devReady
 	b.devMu.RUnlock()
 	if cached {
-		if cacheLive(d) {
+		if cacheLive(d) && b.tunnelAnswers() {
 			return d, nil
 		}
 		b.invalidate()
@@ -610,6 +729,7 @@ func (b *bridge) device() (ios.DeviceEntry, error) {
 	if err != nil {
 		return nd, err
 	}
+	b.sawTunnel()
 	b.devMu.Lock()
 	b.devCopy, b.devReady = nd, true
 	b.devMu.Unlock()
@@ -725,15 +845,38 @@ func listAppsOn(d ios.DeviceEntry) ([]map[string]any, error) {
 	return browseRows(ip)
 }
 
+// shimAttributes are the only keys appRow reads, and all the shim listing asks
+// the phone for (ReturnAttributes). Without them a Browse returns every
+// attribute of every app — paths, containers, entitlements — which over a
+// cellular relay is what pushed a working listing toward its time limit.
+var shimAttributes = []string{
+	installationproxy.CFBundleIdentifier, installationproxy.CFBundleName, "CFBundleDisplayName",
+	"ApplicationType", "SBAppTags", "CFBundleIcons", "CFBundleIconFiles",
+}
+
 // listAppsShim is listAppsOn for no-mux mode: the same listing, over the
-// installation_proxy RSD shim instead of usbmux + lockdown, and bounded. Only
-// the connection differs, so the rows and the two failure words are the same.
+// installation_proxy RSD shim instead of usbmux + lockdown, and bounded by
+// shimListTimeout. Only the connection differs, so the rows and the two
+// failure words are the same.
 func listAppsShim(d ios.DeviceEntry) ([]map[string]any, error) {
+	return listAppsShimBy(d, time.Now().Add(shimListTimeout))
+}
+
+// listAppsShimBy is listAppsShim finishing by deadline (and never taking more
+// than shimListTimeout): the checkin and the listing both fit before it.
+func listAppsShimBy(d ios.DeviceEntry, deadline time.Time) ([]map[string]any, error) {
 	if err := shimListed(d); err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(shimListTimeout)
-	conn, err := ios.ConnectToShimServiceWithTimeout(d, svcAppsShim, shimCheckinTimeout)
+	start := time.Now()
+	if limit := start.Add(shimListTimeout); limit.Before(deadline) {
+		deadline = limit
+	}
+	left := time.Until(deadline)
+	if left <= 0 {
+		return nil, fmt.Errorf("%s: %w: the request's time was already spent", reasonAppsFailed, errAppsDeadline)
+	}
+	conn, err := ios.ConnectToShimServiceWithTimeout(d, svcAppsShim, min(shimCheckinTimeout, left))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
 	}
@@ -746,16 +889,28 @@ func listAppsShim(d ios.DeviceEntry) ([]map[string]any, error) {
 	var expired atomic.Bool
 	timer := time.AfterFunc(time.Until(deadline), func() { expired.Store(true); closeIP() })
 	defer timer.Stop()
-	out, err := browseRows(ip)
+	out, err := browseRowsWith(ip, shimAttributes)
 	if err != nil && expired.Load() {
-		return nil, fmt.Errorf("%s: no complete app list within %s: %w", reasonAppsFailed, shimListTimeout, err)
+		return nil, fmt.Errorf("%s: %w within %s: %w", reasonAppsFailed, errAppsDeadline, deadline.Sub(start).Round(time.Millisecond), err)
 	}
 	return out, err
 }
 
 func browseRows(ip *installationproxy.Connection) ([]map[string]any, error) {
+	return collectRows(ip.BrowseUserApps, ip.BrowseSystemApps)
+}
+
+// browseRowsWith is browseRows asking only for attributes.
+func browseRowsWith(ip *installationproxy.Connection, attributes []string) ([]map[string]any, error) {
+	return collectRows(
+		func() ([]installationproxy.AppInfo, error) { return ip.BrowseUserAppsWithAttributes(attributes) },
+		func() ([]installationproxy.AppInfo, error) { return ip.BrowseSystemAppsWithAttributes(attributes) },
+	)
+}
+
+func collectRows(browses ...func() ([]installationproxy.AppInfo, error)) ([]map[string]any, error) {
 	out := []map[string]any{}
-	for _, browse := range []func() ([]installationproxy.AppInfo, error){ip.BrowseUserApps, ip.BrowseSystemApps} {
+	for _, browse := range browses {
 		apps, err := browse()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", reasonAppsFailed, err)
@@ -771,6 +926,9 @@ func browseRows(ip *installationproxy.Connection) ([]map[string]any, error) {
 // outcome is remembered: a listing that just worked is the best possible proof
 // for /status, and one that just failed is the truth /status must report.
 func (b *bridge) apps() ([]map[string]any, error) {
+	if noMux.on {
+		return b.appsNoMux()
+	}
 	d, err := b.appsDevice()
 	if err != nil {
 		return nil, err
@@ -789,6 +947,47 @@ func (b *bridge) apps() ([]map[string]any, error) {
 		return nil, rerr
 	}
 	out, err = listApps(fresh)
+	b.noteApps(fresh, err, proofListed)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// appsNoMux is apps() over the relay tunnel. The two-attempt shape above, with
+// a full listing limit per attempt and a handshake between them, cost up to
+// about 36 s there, while the installed daemon aborts /apps at 20 s, so a slow
+// listing could never succeed and the user heard "locked or asleep" instead of
+// what failed. Here one deadline (appsBudget) covers the whole request, and the
+// second attempt is made only when it can help and still fit:
+//   - never after the listing ran out of time: the address is pinned for the
+//     life of this process, so a retry asks the same slow tunnel again;
+//   - never when the RSD table does not list the shim: a fresh handshake of the
+//     same phone lists the same services;
+//   - only if a handshake, a checkin and appsRetryListing still fit.
+func (b *bridge) appsNoMux() ([]map[string]any, error) {
+	deadline := time.Now().Add(appsBudget)
+	d, err := b.appsDevice()
+	if err != nil {
+		return nil, err
+	}
+	out, err := listAppsShimBy(d, deadline)
+	b.noteApps(d, err, proofListed)
+	if err == nil {
+		return out, nil
+	}
+	if errors.Is(err, errAppsDeadline) || errors.Is(err, errShimNotListed) ||
+		time.Until(deadline) < noMuxHandshakeTimeout+shimCheckinTimeout+appsRetryListing {
+		return nil, err
+	}
+	// As in apps(): an app-list failure is no evidence about the gesture
+	// session, so only the device selection is dropped.
+	b.dropDevice()
+	fresh, rerr := b.appsDevice()
+	if rerr != nil {
+		return nil, rerr
+	}
+	out, err = listAppsShimBy(fresh, deadline)
 	b.noteApps(fresh, err, proofListed)
 	if err != nil {
 		return nil, err
@@ -977,16 +1176,24 @@ func (st status) summarize() status {
 // the app channel is then probed over the RSD shim on that same tunnel. If the
 // tunnel does not answer, all three are down for that one reason. The
 // UDID reported is only ever the one the handshake proved.
+//
+// Unlike probe(), a failed resolve here DOES condemn the gesture session. In
+// usbmux mode a phone that went away is caught by the usbmux re-checks; in
+// no-mux mode nothing else ever would be, because the HID session rides the
+// very tunnel this handshake just failed on and its writes expect no reply, so
+// taps kept answering {"ok":true} into a dead relay until the process was
+// replaced. The cost is one rebuild on the next gesture if the failure was a
+// passing one; the alternative is a gesture claimed that never happened.
 func (b *bridge) probeNoMux() status {
 	st := status{}
 	d, err := resolve()
 	if err != nil {
 		down := capability{State: capDown, Reason: reasonOf(err), Detail: err.Error()}
 		st.See, st.Act, st.Apps = down, down, down
-		// Observe, do not condemn: see probe().
-		b.dropDevice()
+		b.invalidate()
 		return st.summarize()
 	}
+	b.sawTunnel()
 	st.UDID = d.Properties.SerialNumber
 	st.See, st.Act = seeAct(d)
 	st.Apps = b.appsCapability(d)
@@ -1064,6 +1271,9 @@ func main() {
 	if pin.on {
 		useNoMux(pin)
 		os.Setenv("USBMUXD_SOCKET_ADDRESS", muxGuard)
+		// Every service dial (DTX, display, HID) goes to the one pinned tunnel,
+		// and a route must fit inside the daemon's 20 s: see the budgets.
+		ios.SetTunnelDialTimeout(noMuxDialTimeout)
 	}
 	b := &bridge{}
 	auth := func(h http.HandlerFunc) http.HandlerFunc {

@@ -3,6 +3,7 @@ package ios
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -180,4 +181,23 @@ func TestRsdHandshakeWithTimeoutReportsARefusedDial(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to dial")
 	assert.ErrorIs(t, err, ErrRsdConnect)
+}
+
+// SetTunnelDialTimeout changes the bound DialTunnelTCP applies, and zero puts
+// TunnelDialTimeout back. TEST-NET-1 stands in for a black-holed tunnel; an
+// environment that answers it at once can only show the fast failure.
+func TestSetTunnelDialTimeoutBoundsDialTunnelTCP(t *testing.T) {
+	t.Cleanup(func() { SetTunnelDialTimeout(0) })
+	SetTunnelDialTimeout(250 * time.Millisecond)
+	start := time.Now()
+	_, err := DialTunnelTCP("192.0.2.1:54321")
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "the override must bound the dial, not TunnelDialTimeout")
+	if errors.Is(err, ErrDialTimeout) {
+		assert.Contains(t, err.Error(), "250ms")
+	}
+	SetTunnelDialTimeout(0)
+	assert.Equal(t, int64(0), tunnelDialOverride.Load())
+	SetTunnelDialTimeout(-time.Second)
+	assert.Equal(t, int64(0), tunnelDialOverride.Load(), "a negative bound means the default, not an instant failure")
 }

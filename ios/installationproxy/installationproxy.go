@@ -101,6 +101,31 @@ func (conn *Connection) BrowseSystemApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("System", false))
 }
 
+// BrowseUserAppsWithAttributes is BrowseUserApps asking the device for only the
+// named keys of each app (ClientOptions.ReturnAttributes). An app lacking a key
+// simply comes back without it. With no keys it is BrowseUserApps. Over a slow
+// link this is the difference between every attribute of every app and a
+// handful of short strings.
+func (conn *Connection) BrowseUserAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(withReturnAttributes(browseApps("User", true), attributes))
+}
+
+// BrowseSystemAppsWithAttributes is BrowseSystemApps with ReturnAttributes, as
+// BrowseUserAppsWithAttributes.
+func (conn *Connection) BrowseSystemAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(withReturnAttributes(browseApps("System", false), attributes))
+}
+
+func withReturnAttributes(request map[string]interface{}, attributes []string) map[string]interface{} {
+	if len(attributes) == 0 {
+		return request
+	}
+	if opts, ok := request["ClientOptions"].(map[string]any); ok {
+		opts["ReturnAttributes"] = append([]string(nil), attributes...)
+	}
+	return request
+}
+
 func (conn *Connection) BrowseFileSharingApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("Filesharing", true))
 }
