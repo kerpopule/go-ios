@@ -44,6 +44,13 @@
 // condemns the gesture session. Reasons the installed daemon does not know are
 // reported under the nearest one it does, with the precise cause in the detail
 // (see the causes).
+//
+// # One contact at a time with the RSD port
+//
+// The phone resets an RSD handshake in flight when a second connection reaches
+// its RSD port (measured 2026-09-23, both roads). Every contact this process
+// makes with that port is serialised per tunnel, concurrent /status calls share
+// one probe, and a reset handshake is retried once: see rsdgate.go.
 package main
 
 import (
@@ -76,7 +83,8 @@ import (
 // resolveDevice performs a live RSD Handshake over the tunnel every call. That
 // is one control-channel round trip to the phone's tunnel endpoint — it starts
 // no service, draws nothing and does not wake the screen — but it is not free,
-// so poll /status on the order of seconds, not milliseconds.
+// so poll /status on the order of seconds, not milliseconds. (Callers within
+// statusReuse of each other share one probe: see bridge.status.)
 const (
 	svcScreenshot = "com.apple.instruments.dtservicehub"
 	svcHID        = "com.apple.coredevice.hid.universalhidservice"
@@ -156,7 +164,9 @@ var appsProbeTTL = 5 * time.Second
 // No-mux budgets. The bridge gives a /status call 12 s and the installed daemon
 // aborts every route at 20 s (PhoneDeviceBridge timeoutMs), after which the
 // user hears "locked or asleep" whatever really failed. So it is each whole
-// ROUTE over the relay tunnel that must fit, not each step:
+// ROUTE over the relay tunnel that must fit, not each step. A handshake's 6 s
+// and the liveness test's 2 s include waiting for the tunnel's RSD gate and
+// the one retry of a reset handshake (rsdgate.go):
 //
 //	/status  handshake 6 + shim checkin 4                              = 10 s
 //	/apps    one appsBudget deadline covers the device, the checkin, the
@@ -172,8 +182,8 @@ var (
 	appsRetryListing      = 2 * time.Second  // the least listing time a retry must still have
 	noMuxDialTimeout      = 5 * time.Second  // every service dial (DTX, display, HID) over the pinned tunnel
 
-	// The liveness test: a TCP connect to the RSD port, as the bridge's keeper
-	// does. A proof younger than liveProofTTL is trusted without a new connect.
+	// The liveness test: a TCP connect to the RSD port, under the tunnel's RSD
+	// gate. A proof younger than liveProofTTL is trusted without a new connect.
 	liveCheckTimeout = 2 * time.Second
 	liveProofTTL     = 3 * time.Second
 )
@@ -276,24 +286,29 @@ var (
 	// resolveDevice, so a test that swaps `resolve` wholesale can never see
 	// which entry resolveDevice actually caches. With this seam a test can run
 	// the real resolveDevice with no tunnel and no phone.
-	handshake = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, error) {
-		rsd, err := ios.NewWithAddrPortDevice(info.Address, info.RsdPort, d)
-		if err != nil {
+	//
+	// It is one attempt, finished within timeout; resolveDevice runs it under
+	// the tunnel's RSD gate (rsdHandshake). It used to be unbounded after its
+	// 15 s dial, which a gate every later contact queues behind cannot afford.
+	// Same two reasons: setup failures are phone_tunnel_unreachable, a failed
+	// handshake exchange phone_handshake_failed.
+	handshake = func(info tunnel.Tunnel, d ios.DeviceEntry, timeout time.Duration) (ios.RsdPortProvider, error) {
+		res, err := ios.RsdHandshakeWithTimeout(info.Address, info.RsdPort, d, timeout)
+		if errors.Is(err, ios.ErrRsdConnect) {
 			return nil, fmt.Errorf("phone_tunnel_unreachable: %w", err)
 		}
-		p, err := rsd.Handshake()
-		rsd.Close()
 		if err != nil {
 			return nil, fmt.Errorf("phone_handshake_failed: %w", err)
 		}
-		return p, nil
+		return res, nil
 	}
 
 	// handshakeNoMux is the no-mux handshake: the same two reasons as
-	// handshake, but bounded end to end, and it keeps the UDID the phone
-	// reports, because in no-mux mode nothing else can say which phone this is.
-	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, string, error) {
-		res, err := ios.RsdHandshakeWithTimeout(info.Address, info.RsdPort, d, noMuxHandshakeTimeout)
+	// handshake, bounded end to end, and it keeps the UDID the phone reports,
+	// because in no-mux mode nothing else can say which phone this is. One
+	// attempt within timeout; resolveNoMux runs it under the tunnel's gate.
+	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry, timeout time.Duration) (ios.RsdPortProvider, string, error) {
+		res, err := ios.RsdHandshakeWithTimeout(info.Address, info.RsdPort, d, timeout)
 		if errors.Is(err, ios.ErrRsdConnect) {
 			return nil, "", fmt.Errorf("phone_tunnel_unreachable: %w", err)
 		}
@@ -319,12 +334,15 @@ var (
 		return nil
 	}
 
-	// tunnelAlive is the no-mux liveness test, the same one the bridge's keeper
-	// runs: a TCP connect to the RSD port on the pinned tunnel, closed at once.
-	// It starts no service and costs the phone one SYN. It exists because a
-	// black-holed tunnel (utun still up, nobody answering) is otherwise found
-	// only by a 15 s service dial, and a HID report, which expects no reply,
-	// is "sent" into it without any error at all.
+	// tunnelAlive is the no-mux liveness test: a TCP connect to the RSD port on
+	// the pinned tunnel, closed at once. It starts no service and costs the
+	// phone one SYN. It exists because a black-holed tunnel (utun still up,
+	// nobody answering) is otherwise found only by a 15 s service dial, and a
+	// HID report, which expects no reply, is "sent" into it without any error
+	// at all. It is a contact with the RSD port, so it only ever runs under the
+	// tunnel's gate (rsdAlive): a connect landing on a handshake in flight is
+	// exactly what made the phone reset it. (The bridge's keeper no longer
+	// connects here at all: it pings the tunnel address.)
 	tunnelAlive = func(addr string, port int, timeout time.Duration) error {
 		c, err := ios.DialTunnelTCPWithTimeout(net.JoinHostPort(addr, strconv.Itoa(port)), timeout)
 		if err != nil {
@@ -400,6 +418,10 @@ type bridge struct {
 	// probe and by every real /apps call, so the two answer each other.
 	probeMu   sync.Mutex
 	appsProof appsProof
+
+	// The /status probe in flight, or the last one (bridge.status).
+	flightMu sync.Mutex
+	flight   *statusFlight
 }
 
 // appsProof is one remembered answer from the app-list channel.
@@ -469,7 +491,11 @@ func resolveDevice() (ios.DeviceEntry, error) {
 	if err != nil {
 		return dev, err
 	}
-	provider, err := handshake(info, dev)
+	provider, _, err := rsdHandshake(info.Address, info.RsdPort, muxHandshakeTimeout,
+		func(timeout time.Duration) (ios.RsdPortProvider, string, error) {
+			p, err := handshake(info, dev, timeout)
+			return p, "", err
+		})
 	if err != nil {
 		return dev, err
 	}
@@ -497,7 +523,11 @@ func resolveDevice() (ios.DeviceEntry, error) {
 func resolveNoMux() (ios.DeviceEntry, error) {
 	pin := noMux
 	d := ios.DeviceEntry{Address: pin.addr, Properties: ios.DeviceProperties{ConnectionType: connNoMux}}
-	p, udid, err := handshakeNoMux(tunnel.Tunnel{Address: pin.addr, RsdPort: pin.rsd, Udid: pin.udid}, d)
+	info := tunnel.Tunnel{Address: pin.addr, RsdPort: pin.rsd, Udid: pin.udid}
+	p, udid, err := rsdHandshake(pin.addr, pin.rsd, noMuxHandshakeTimeout,
+		func(timeout time.Duration) (ios.RsdPortProvider, string, error) {
+			return handshakeNoMux(info, d, timeout)
+		})
 	if err != nil {
 		return d, err
 	}
@@ -582,6 +612,11 @@ func (b *bridge) sawTunnel() { b.aliveAt.Store(time.Now().UnixNano()) }
 // liveProofTTL, or does it accept a connection now (bounded by
 // liveCheckTimeout)? Always true in usbmux mode, where the usbmux re-checks
 // (cacheLive, appsEntry) are what catch a phone that went away.
+//
+// The connect waits for the tunnel's RSD gate inside liveCheckTimeout, and a
+// handshake that succeeded while it waited is its proof. A handshake that holds
+// the gate past liveCheckTimeout counts as not answering in time, as a connect
+// that took that long always did.
 func (b *bridge) tunnelAnswers() bool {
 	if !noMux.on {
 		return true
@@ -589,7 +624,7 @@ func (b *bridge) tunnelAnswers() bool {
 	if at := b.aliveAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < liveProofTTL {
 		return true
 	}
-	if err := tunnelAlive(noMux.addr, noMux.rsd, liveCheckTimeout); err != nil {
+	if err := rsdAlive(noMux.addr, noMux.rsd, liveCheckTimeout); err != nil {
 		log.Printf("no-mux: %v", err)
 		return false
 	}
@@ -1300,8 +1335,10 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", auth(func(w http.ResponseWriter, r *http.Request) {
 		// Always 200: the body IS the answer, and a caller that cannot read it
-		// learns nothing about which of the three capabilities died.
-		writeJSON(w, 200, b.probe())
+		// learns nothing about which of the three capabilities died. Concurrent
+		// callers share one probe (bridge.status): two handshakes at once make
+		// the phone reset one of them.
+		writeJSON(w, 200, b.status())
 	}))
 	mux.HandleFunc("/screenshot", auth(func(w http.ResponseWriter, r *http.Request) {
 		var png []byte

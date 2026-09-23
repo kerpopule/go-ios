@@ -75,7 +75,7 @@ type handshakeStub struct {
 func stubNoMuxHandshake(t *testing.T, table ios.RsdPortProvider, udid string) *handshakeStub {
 	t.Helper()
 	h := &handshakeStub{table: table, udid: udid}
-	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, string, error) {
+	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry, _ time.Duration) (ios.RsdPortProvider, string, error) {
 		h.calls++
 		h.got = info
 		if d.DeviceID != 0 || d.Properties.ConnectionType == "USB" {

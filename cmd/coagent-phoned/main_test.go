@@ -791,7 +791,7 @@ func tunnelEnv(t *testing.T) {
 func stubHandshake(t *testing.T, p ios.RsdPortProvider, err error) {
 	t.Helper()
 	old := handshake
-	handshake = func(tunnel.Tunnel, ios.DeviceEntry) (ios.RsdPortProvider, error) { return p, err }
+	handshake = func(tunnel.Tunnel, ios.DeviceEntry, time.Duration) (ios.RsdPortProvider, error) { return p, err }
 	t.Cleanup(func() { handshake = old })
 }
 

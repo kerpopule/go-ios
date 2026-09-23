@@ -321,9 +321,9 @@ func TestNoMuxAppsFitsOneDeadline(t *testing.T) {
 	noMuxMode(t, defaultPin())
 	stubNoMuxHandshake(t, withShim(port), testUDID)
 	inner := handshakeNoMux
-	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, string, error) {
+	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry, timeout time.Duration) (ios.RsdPortProvider, string, error) {
 		time.Sleep(200 * time.Millisecond)
-		return inner(info, d)
+		return inner(info, d, timeout)
 	}
 	setDuration(t, &appsBudget, 500*time.Millisecond)
 	start := time.Now()
