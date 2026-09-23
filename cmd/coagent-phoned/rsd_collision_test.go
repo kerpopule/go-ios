@@ -764,6 +764,76 @@ func TestStatusAbandonsAProbeThatOutlivedEveryBudget(t *testing.T) {
 	}
 }
 
+// A probe that panics still finishes its flight. The caller and every caller
+// that joined it are answered at once, with phone_bridge_error and nothing
+// claimed up or down; the next /status probes afresh instead of joining a
+// flight that never ends (which held every later /status for
+// statusFlightLimit, 20 s: past the bridge's 12 s alarm). The trigger is real:
+// go-ios's RSD handshake type-asserts the phone's answer unchecked.
+func TestStatusSurvivesAProbeThatPanics(t *testing.T) {
+	noMuxMode(t, defaultPin())
+	var calls atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	handshakeNoMux = func(tunnel.Tunnel, ios.DeviceEntry, time.Duration) (ios.RsdPortProvider, string, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			panic("interface conversion: interface {} is nil, not map[string]interface {}")
+		}
+		return fullRsd, testUDID, nil
+	}
+	b := &bridge{}
+	first, joined := make(chan status, 1), make(chan status, 1)
+	go func() {
+		// As net/http does for a handler: a panic that escapes fails this call only.
+		defer func() {
+			if r := recover(); r != nil {
+				first <- status{Detail: fmt.Sprintf("the panic escaped status(): %v", r)}
+			}
+		}()
+		first <- b.status()
+	}()
+	<-entered
+	go func() { joined <- b.status() }()
+	time.Sleep(50 * time.Millisecond) // the second caller is waiting on the first one's flight
+	close(release)
+	for _, c := range []struct {
+		name string
+		ch   chan status
+	}{{"a caller that joined it", joined}, {"the caller whose probe panicked", first}} {
+		select {
+		case st := <-c.ch:
+			if st.OK || st.Reason != reasonBridgeError ||
+				!strings.HasPrefix(st.Detail, reasonBridgeError+": "+causeProbePanicked+": interface conversion") {
+				t.Fatalf("%s: wanted phone_bridge_error led by the cause, got %+v", c.name, st)
+			}
+			for _, cp := range []capability{st.See, st.Act, st.Apps} {
+				if cp.State != capUnknown || cp.Reason != reasonBridgeError {
+					t.Fatalf("%s: a probe that panicked measured nothing, got %+v", c.name, cp)
+				}
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s is still waiting on a probe that panicked", c.name)
+		}
+	}
+	// Straight after: a fresh probe, not the crashed answer given again (it is
+	// younger than statusReuse) and not a wait behind it.
+	next := make(chan status, 1)
+	go func() { next <- b.status() }()
+	select {
+	case st := <-next:
+		if !st.See.up() || !st.Act.up() || st.See.AgeMs != 0 || calls.Load() != 2 {
+			t.Fatalf("wanted a fresh probe after the panic: %+v, %d handshakes", st, calls.Load())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a /status after a panicked probe waited behind it")
+	}
+	// The gate was released during the panic: another RSD contact gets it at once.
+	if err := rsdAlive(noMuxAddr, noMuxRsd, 100*time.Millisecond); err != nil {
+		t.Fatalf("the tunnel's RSD gate stayed held after the panic: %v", err)
+	}
+}
+
 // The handler's shared /status gives the incident state the same bytes as
 // probe() (TestStatusBytesForTheIncidentState pins those).
 func TestSharedStatusBytesForTheIncidentState(t *testing.T) {

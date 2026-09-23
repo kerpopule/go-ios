@@ -40,6 +40,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"syscall"
@@ -218,10 +219,11 @@ var (
 
 // statusFlight is one /status probe, in flight or finished.
 type statusFlight struct {
-	start time.Time
-	done  chan struct{}
-	st    status    // set before done is closed
-	end   time.Time // set before done is closed
+	start    time.Time
+	done     chan struct{}
+	st       status    // set before done is closed
+	end      time.Time // set before done is closed
+	panicked bool      // set before done is closed: the probe measured nothing, so it is never answered again
 }
 
 // status answers /status. Concurrent callers share one probe, and an answer
@@ -233,7 +235,7 @@ func (b *bridge) status() status {
 	if f := b.flight; f != nil {
 		select {
 		case <-f.done:
-			if age := time.Since(f.end); age < statusReuse {
+			if age := time.Since(f.end); age < statusReuse && !f.panicked {
 				b.flightMu.Unlock()
 				return f.st.aged(age)
 			}
@@ -260,10 +262,43 @@ func (b *bridge) status() status {
 	f := &statusFlight{start: time.Now(), done: make(chan struct{})}
 	b.flight = f
 	b.flightMu.Unlock()
-	st := b.probe()
-	f.st, f.end = st, time.Now()
-	close(f.done)
-	return st
+	return b.fly(f)
+}
+
+// fly runs f's probe and finishes f whatever happens, a panic included.
+//
+// Before the probe was shared, a panic in it failed only its own call (net/http
+// recovers a handler). Left unfinished, f would hold every later /status until
+// statusFlightLimit ran out: 20 s, past the bridge's 12 s alarm and level with
+// the daemon's 20 s abort. go-ios's RSD handshake type-asserts the phone's
+// answer unchecked, so one malformed answer is enough. So the panic is
+// recovered here and its stack logged (it is still a bug to find), the caller
+// and every caller that joined get probePanicked's answer at once, and the
+// answer is never given again: the next /status probes afresh.
+func (b *bridge) fly(f *statusFlight) (st status) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("status: the probe panicked: %v\n%s", r, debug.Stack())
+			st = probePanicked(r)
+			f.panicked = true
+		}
+		f.st, f.end = st, time.Now()
+		close(f.done)
+	}()
+	return b.probe()
+}
+
+// probePanicked is the /status answer of a probe that panicked. Nothing was
+// measured, so all three capabilities are unknown (not ok, and not a claim
+// that anything is down), under phone_bridge_error: this process failed in a
+// way it cannot name, which is exactly that reason's words to the user (try
+// once more; if it fails again, restart the bridge). It is not a road reason,
+// so the daemon does not go re-measuring a road that is fine. The cause leads
+// the detail, where the logs can still tell it apart.
+func probePanicked(r any) status {
+	c := capability{State: capUnknown, Reason: reasonBridgeError,
+		Detail: fmt.Sprintf("%s: %s: %v", reasonBridgeError, causeProbePanicked, r)}
+	return status{See: c, Act: c, Apps: c}.summarize()
 }
 
 // aged is st answered again age after it was measured.

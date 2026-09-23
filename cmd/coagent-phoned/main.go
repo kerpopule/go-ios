@@ -106,6 +106,10 @@ const (
 	reasonDeviceFailed     = "phone_device_failed"      // the pinned tunnel answers as another phone (cause: causeWrongDevice)
 	reasonTunnelEnvInvalid = "phone_tunnel_env_invalid" // the no-mux switch or its tunnel pin will not parse
 	reasonNoMux            = "phone_no_mux"             // something tried to read usbmux in no-mux mode (a bug, never a phone state)
+
+	// Either mode: this process failed in a way it cannot name (a /status probe
+	// that panicked; see bridge.fly). The daemon's own catch-all, used as such.
+	reasonBridgeError = "phone_bridge_error"
 )
 
 // Causes: no-mux states the installed daemon has no word for. Co-Agent 0.5.67
@@ -124,6 +128,7 @@ const (
 const (
 	causeWrongDevice           = "phone_wrong_device"            // the tunnel answers, but as a different phone than COAGENT_PHONE_UDID
 	causeAppsRemoteUnavailable = "phone_apps_unavailable_remote" // the phone's RSD table does not list the installation_proxy shim
+	causeProbePanicked         = "phone_probe_panicked"          // a /status probe panicked (under phone_bridge_error)
 )
 
 var (

@@ -459,6 +459,7 @@ var noMuxReasons = []string{
 	"phone_tunnel_unreachable", "phone_handshake_failed", "phone_capture_failed", "phone_launch_failed",
 	"phone_hid_failed", "phone_touch_failed", "phone_stream_receiver_failed", "phone_display_service_failed",
 	"phone_stream_start_failed", "phone_bridge_unauthorized", "phone_point_invalid", "phone_bundle_invalid",
+	reasonBridgeError,
 }
 
 func TestNoMuxReasonsAreOnesTheInstalledDaemonKnows(t *testing.T) {
@@ -471,7 +472,7 @@ func TestNoMuxReasonsAreOnesTheInstalledDaemonKnows(t *testing.T) {
 			t.Fatalf("%s would reach the user as phone_bridge_error: the installed daemon does not know it", r)
 		}
 	}
-	for _, c := range []string{causeWrongDevice, causeAppsRemoteUnavailable} {
+	for _, c := range []string{causeWrongDevice, causeAppsRemoteUnavailable, causeProbePanicked} {
 		if known[c] {
 			t.Fatalf("%s is a daemon reason now; report it as one", c)
 		}
