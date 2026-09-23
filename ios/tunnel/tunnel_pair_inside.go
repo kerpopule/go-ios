@@ -67,7 +67,20 @@ func PairThroughTunnel(address string, rsdPort int, device ios.DeviceEntry, p Pa
 // at address ("host:port") — pair-VERIFY only. Unlike ManualPair it never falls back to pair-setup,
 // so it can never raise a prompt on the phone; a nil error means the record works on that road.
 func VerifyRemotePairing(address string, timeout time.Duration, p PairRecordManager) error {
-	conn, err := dialRemotePairing(address, timeout)
+	return VerifyRemotePairingVia(address, timeout, p, nil)
+}
+
+// VerifyRemotePairingVia is VerifyRemotePairing with the control channel opened by dial (for example
+// StreamsDialer) instead of a direct TCP connect. timeout bounds the dial and the exchange together.
+// A nil dial is exactly VerifyRemotePairing.
+func VerifyRemotePairingVia(address string, timeout time.Duration, p PairRecordManager, dial RemotePairingDialer) error {
+	var conn *rpPairingConn
+	var err error
+	if dial == nil {
+		conn, err = dialRemotePairing(address, timeout)
+	} else {
+		conn, err = dialRemotePairingVia(context.Background(), dial, address, timeout, StreamsLegControl)
+	}
 	if err != nil {
 		return err
 	}
@@ -99,6 +112,13 @@ func VerifyRemotePairing(address string, timeout time.Duration, p PairRecordMana
 // instead of a Bonjour result — the away-from-desk road, where the phone is 10.71.0.2 on the
 // Co-Agent utun and Bonjour cannot see it.
 func ConnectToTunnelOverRemotePairingAt(ctx context.Context, address string, device ios.DeviceEntry, p PairRecordManager) (Tunnel, error) {
+	return ConnectToTunnelOverRemotePairingAtVia(ctx, address, device, p, nil)
+}
+
+// ConnectToTunnelOverRemotePairingAtVia is ConnectToTunnelOverRemotePairingAt with both TCP legs
+// opened by dial — the loopback-streams road passes StreamsDialer and "phone:49152". A nil dial is
+// exactly ConnectToTunnelOverRemotePairingAt.
+func ConnectToTunnelOverRemotePairingAtVia(ctx context.Context, address string, device ios.DeviceEntry, p PairRecordManager, dial RemotePairingDialer) (Tunnel, error) {
 	host, portText, err := net.SplitHostPort(address)
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairingAt: %q is not host:port: %w", address, err)
@@ -107,9 +127,9 @@ func ConnectToTunnelOverRemotePairingAt(ctx context.Context, address string, dev
 	if err != nil {
 		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairingAt: bad port in %q: %w", address, err)
 	}
-	return ConnectToTunnelOverRemotePairing(ctx, ios.RemotePairingEndpoint{
+	return connectToTunnelOverRemotePairing(ctx, ios.RemotePairingEndpoint{
 		HostName:  host,
 		Port:      port,
 		Addresses: []string{host},
-	}, device, p)
+	}, device, p, dial)
 }

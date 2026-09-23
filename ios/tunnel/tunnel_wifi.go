@@ -2,7 +2,10 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
@@ -39,15 +42,39 @@ const remotePairingHandshakeTimeout = 30 * time.Second
 //     from then on.
 //   - Developer Mode on the phone.
 func ConnectToTunnelOverRemotePairing(ctx context.Context, endpoint ios.RemotePairingEndpoint, device ios.DeviceEntry, p PairRecordManager) (Tunnel, error) {
+	return connectToTunnelOverRemotePairing(ctx, endpoint, device, p, nil)
+}
+
+// ConnectToTunnelOverRemotePairingVia is ConnectToTunnelOverRemotePairing with BOTH of its TCP legs —
+// the RemotePairing control channel and the TLS-PSK tunnel port — opened by dial instead of a direct
+// TCP connect. A nil dial is exactly ConnectToTunnelOverRemotePairing.
+//
+// The loopback-streams road (contract rev 4) passes StreamsDialer, with endpoint.Addresses[0] set to
+// "phone" or "127.0.0.1": the phone's tunnel extension connects to its OWN loopback, so the tunnel
+// port is dialled at that same host. Everything after the TLS-PSK handshake is unchanged.
+func ConnectToTunnelOverRemotePairingVia(ctx context.Context, endpoint ios.RemotePairingEndpoint, device ios.DeviceEntry, p PairRecordManager, dial RemotePairingDialer) (Tunnel, error) {
+	return connectToTunnelOverRemotePairing(ctx, endpoint, device, p, dial)
+}
+
+func connectToTunnelOverRemotePairing(ctx context.Context, endpoint ios.RemotePairingEndpoint, device ios.DeviceEntry, p PairRecordManager, dial RemotePairingDialer) (Tunnel, error) {
 	address := endpoint.Address()
 	if address == "" {
 		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: %s advertised no dialable address", endpoint.HostName)
 	}
 
-	conn, err := dialRemotePairing(address, remotePairingHandshakeTimeout)
-	if err != nil {
-		// The most likely cause by far, said plainly rather than as a dial error.
-		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: %s advertised %s but did not answer — a sleeping iPhone keeps advertising after it stops accepting connections, so wake and unlock it and try again: %w", endpoint.HostName, address, err)
+	var conn *rpPairingConn
+	var err error
+	if dial == nil {
+		conn, err = dialRemotePairing(address, remotePairingHandshakeTimeout)
+		if err != nil {
+			// The most likely cause by far, said plainly rather than as a dial error.
+			return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: %s advertised %s but did not answer — a sleeping iPhone keeps advertising after it stops accepting connections, so wake and unlock it and try again: %w", endpoint.HostName, address, err)
+		}
+	} else {
+		conn, err = dialRemotePairingVia(ctx, dial, address, remotePairingHandshakeTimeout, StreamsLegControl)
+		if err != nil {
+			return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: could not open the RemotePairing control channel at %s: %w", address, err)
+		}
 	}
 	if err := conn.SetDeadline(time.Now().Add(remotePairingHandshakeTimeout)); err != nil {
 		_ = conn.Close()
@@ -67,19 +94,28 @@ func ConnectToTunnelOverRemotePairing(ctx context.Context, endpoint ios.RemotePa
 		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: failed to create tcp tunnel listener: %w", err)
 	}
 
-	// The listener is on the phone's Wi-Fi interface here, not on a link-local
-	// USB address — so it is reached at the same host that answered the
-	// control channel, on the port it just named.
-	tunnelAddr := hostWithPort(endpoint.Addresses[0], tunnelPort)
-	tcpConn, err := ios.DialTunnelTCP(tunnelAddr)
-	if err != nil {
-		_ = conn.Close()
-		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: failed to dial tunnel port %s: %w", tunnelAddr, err)
-	}
-	tlsConn, err := tlspsk.Client(tcpConn, ts.sharedSecret)
-	if err != nil {
-		_ = conn.Close()
-		return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: TLS-PSK handshake failed: %w", err)
+	var tlsConn net.Conn
+	if dial == nil {
+		// The listener is on the phone's Wi-Fi interface here, not on a link-local
+		// USB address — so it is reached at the same host that answered the
+		// control channel, on the port it just named.
+		tunnelAddr := hostWithPort(endpoint.Addresses[0], tunnelPort)
+		tcpConn, err := ios.DialTunnelTCP(tunnelAddr)
+		if err != nil {
+			_ = conn.Close()
+			return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: failed to dial tunnel port %s: %w", tunnelAddr, err)
+		}
+		tlsConn, err = tlspsk.Client(tcpConn, ts.sharedSecret)
+		if err != nil {
+			_ = conn.Close()
+			return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: TLS-PSK handshake failed: %w", err)
+		}
+	} else {
+		tlsConn, err = dialTunnelPortVia(ctx, dial, endpoint.Addresses[0], tunnelPort, ts.sharedSecret)
+		if err != nil {
+			_ = conn.Close()
+			return Tunnel{}, fmt.Errorf("ConnectToTunnelOverRemotePairing: %w", err)
+		}
 	}
 
 	// The control-channel deadline covered the HANDSHAKE only. What comes out
@@ -90,6 +126,40 @@ func ConnectToTunnelOverRemotePairing(ctx context.Context, endpoint ios.RemotePa
 	_ = conn.SetDeadline(time.Time{})
 
 	return connectToTunnelLockdown(ctx, device, tlsConn)
+}
+
+// dialTunnelPortVia opens the per-session TLS-PSK tunnel port through dial, at the same host the
+// control channel used, and runs the TLS-PSK handshake on it.
+//
+// Unlike the direct path, the handshake is bounded: over loopback streams the stream can open and
+// then never carry a byte (the phone's listener accepted and stalled, or the epoch is wedged), and an
+// unbounded handshake would hold the caller forever. The deadline is cleared once the handshake is in.
+func dialTunnelPortVia(ctx context.Context, dial RemotePairingDialer, host string, port uint16, psk []byte) (net.Conn, error) {
+	tunnelAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	dctx, cancel := context.WithTimeout(ctx, ios.TunnelDialTimeout)
+	raw, err := dial(dctx, tunnelAddr)
+	cancel()
+	if err == nil && raw == nil {
+		err = errors.New("dialer returned no connection")
+	}
+	if err != nil {
+		tagStreamsLeg(err, StreamsLegTunnelPort)
+		return nil, fmt.Errorf("failed to open tunnel port %s (the RemotePairing control channel on the same host worked): %w", tunnelAddr, err)
+	}
+	if err := raw.SetDeadline(time.Now().Add(ios.TunnelDialTimeout)); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("failed to bound the TLS-PSK handshake on %s: %w", tunnelAddr, err)
+	}
+	tlsConn, err := tlspsk.Client(raw, psk)
+	if err != nil {
+		// tlspsk.Client has already closed raw.
+		return nil, fmt.Errorf("TLS-PSK handshake on %s failed: %w", tunnelAddr, err)
+	}
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("failed to clear the TLS-PSK handshake deadline on %s: %w", tunnelAddr, err)
+	}
+	return tlsConn, nil
 }
 
 // hostWithPort joins a host that may be an IPv6 literal, with or without a

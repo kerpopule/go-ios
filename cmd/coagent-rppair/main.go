@@ -18,12 +18,33 @@
 //	    bring up the CoreDevice tunnel over RemotePairing at HOST:PORT and hold it (needs root);
 //	    prints the same JSON shape as `ios tunnel ls`
 //
+//	coagent-rppair verify --via-streams SOCK [--at phone:49152] --records DIR [--timeout 15s]
+//	coagent-rppair tunnel --via-streams SOCK [--at phone:49152] [--udid U] --records DIR
+//	    the same, on the loopback-streams road (tunnel contract rev 4): the phone's tunnel extension
+//	    connects to its OWN loopback and the desk peer carries the bytes, exposed here as a SOCKS5
+//	    unix socket. Both the control channel and the TLS-PSK tunnel port go through SOCK. --at is
+//	    optional and must be phone:PORT or 127.0.0.1:PORT, PORT in 49152-65535.
+//
 // Every result is one JSON line: {"ok":true,...} or {"ok":false,"reason":...,"error":...}.
+//
+// With --via-streams, success gains "via":"streams" (for tunnel, on each tunnel object), and failure
+// keeps its reason and adds "via":"streams" plus "streams":<word>:
+//
+//	socket_unavailable | socks_protocol | general_failure | not_allowed | phone_not_linked |
+//	timeout | connection_refused | command_not_supported | address_type_not_supported
+//
+// with "rep" (the SOCKS reply code, when there was one), "leg" ("control" = the :49152 front door,
+// "tunnel_port" = the per-session TLS-PSK listener) and "target". "streams":"opened" means every
+// stream opened and the failure came from RemotePairing, TLS or the utun above it; an EOF there
+// usually means the relay epoch ended mid-exchange. A --at the streams road cannot reach fails with
+// reason "via_streams_bad_target". The phone's own reason for a refusal is in the desk peer's
+// tunnel-peer-status.json, streams.lastFailure.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -47,6 +68,52 @@ func fail(reason string, err error) {
 	}
 	emit(out)
 	os.Exit(1)
+}
+
+// streamsDefaultAt is the RemotePairing front door on the phone's loopback, as the desk names it.
+const streamsDefaultAt = "phone:49152"
+
+// streamsFailure is the failure line for the loopback-streams road: the ordinary reason and error,
+// plus which streams step failed.
+func streamsFailure(reason string, err error) map[string]any {
+	out := map[string]any{"ok": false, "reason": reason, "via": "streams"}
+	if err != nil {
+		out["error"] = err.Error()
+	}
+	var se *tunnel.StreamsError
+	if errors.As(err, &se) {
+		out["streams"] = se.Word
+		if se.Rep >= 0 {
+			out["rep"] = se.Rep
+		}
+		if se.Leg != "" {
+			out["leg"] = se.Leg
+		}
+		if se.Target != "" {
+			out["target"] = se.Target
+		}
+	} else {
+		out["streams"] = "opened"
+	}
+	return out
+}
+
+func failStreams(reason string, err error) {
+	emit(streamsFailure(reason, err))
+	os.Exit(1)
+}
+
+// withVia marks each tunnel object with the road it came up on, keeping the `ios tunnel ls` fields.
+func withVia(tunnels []tunnel.Tunnel, via string) []map[string]any {
+	out := make([]map[string]any, 0, len(tunnels))
+	for _, t := range tunnels {
+		b, _ := json.Marshal(t)
+		m := map[string]any{}
+		_ = json.Unmarshal(b, &m)
+		m["via"] = via
+		out = append(out, m)
+	}
+	return out
 }
 
 func records(dir string) tunnel.PairRecordManager {
@@ -78,9 +145,21 @@ func main() {
 	udid := fs.String("udid", "", "phone UDID")
 	dir := fs.String("records", "", "pair record directory")
 	timeout := fs.Duration("timeout", 15*time.Second, "verify timeout")
+	viaStreams := fs.String("via-streams", "", "desk peer loopback-streams SOCKS5 unix socket (verify, tunnel)")
 	_ = fs.Parse(os.Args[2:])
 	if *dir == "" {
 		fail("--records is required: this Mac's RemotePairing identity lives there", nil)
+	}
+	if *viaStreams != "" {
+		if cmd != "verify" && cmd != "tunnel" {
+			fail("--via-streams applies to verify and tunnel only", nil)
+		}
+		if *at == "" {
+			*at = streamsDefaultAt
+		}
+		if err := tunnel.ValidateStreamsTarget(*at); err != nil {
+			failStreams("via_streams_bad_target", err)
+		}
 	}
 
 	switch cmd {
@@ -98,6 +177,13 @@ func main() {
 			fail("verify needs --at HOST:PORT", nil)
 		}
 		pm := records(*dir)
+		if *viaStreams != "" {
+			if err := tunnel.VerifyRemotePairingVia(*at, *timeout, pm, tunnel.StreamsDialer(*viaStreams)); err != nil {
+				failStreams("verify_failed", err)
+			}
+			emit(map[string]any{"ok": true, "verified": true, "at": *at, "via": "streams"})
+			return
+		}
 		if err := tunnel.VerifyRemotePairing(*at, *timeout, pm); err != nil {
 			fail("verify_failed", err)
 		}
@@ -109,12 +195,26 @@ func main() {
 		pm := records(*dir)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		t, err := tunnel.ConnectToTunnelOverRemotePairingAt(ctx, *at, device(*udid), pm)
-		if err != nil {
-			fail("tunnel_failed", err)
+		var t tunnel.Tunnel
+		var err error
+		if *viaStreams != "" {
+			t, err = tunnel.ConnectToTunnelOverRemotePairingAtVia(ctx, *at, device(*udid), pm, tunnel.StreamsDialer(*viaStreams))
+			if err != nil {
+				failStreams("tunnel_failed", err)
+			}
+		} else {
+			t, err = tunnel.ConnectToTunnelOverRemotePairingAt(ctx, *at, device(*udid), pm)
+			if err != nil {
+				fail("tunnel_failed", err)
+			}
 		}
 		defer func() { _ = t.Close() }()
-		info, _ := json.Marshal([]tunnel.Tunnel{t})
+		var info []byte
+		if *viaStreams != "" {
+			info, _ = json.Marshal(withVia([]tunnel.Tunnel{t}, "streams"))
+		} else {
+			info, _ = json.Marshal([]tunnel.Tunnel{t})
+		}
 		fmt.Println(string(info))
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
