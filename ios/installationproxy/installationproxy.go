@@ -69,6 +69,30 @@ func New(device ios.DeviceEntry) (*Connection, error) {
 	return &Connection{deviceConn: deviceConn, plistCodec: ios.NewPlistCodec()}, nil
 }
 
+// ShimServiceName is the installation_proxy shim listed in the RSD table of an
+// iOS 17+ tunnel. RsdHandshakeResponse.GetPort matches names exactly, so the
+// full name must be used.
+const ShimServiceName = "com.apple.mobile.installation_proxy.shim.remote"
+
+// NewWithShimConnection connects to installation_proxy over a tunnel interface:
+// the port comes from remote service discovery and the RSDCheckin the shim
+// requires is done before returning. No usbmuxd, lockdown session or pair
+// record is involved. New is unchanged and still takes the usbmuxd road.
+func NewWithShimConnection(device ios.DeviceEntry) (*Connection, error) {
+	deviceConn, err := ios.ConnectToShimService(device, ShimServiceName)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithConnection(deviceConn), nil
+}
+
+// NewWithConnection wraps a connection that is already open to the
+// installation_proxy service (or its shim, after RSDCheckin), for callers that
+// open it themselves, for example with ios.ConnectToShimServiceWithTimeout.
+func NewWithConnection(deviceConn ios.DeviceConnectionInterface) *Connection {
+	return &Connection{deviceConn: deviceConn, plistCodec: ios.NewPlistCodec()}
+}
+
 func (conn *Connection) BrowseUserApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("User", true))
 }

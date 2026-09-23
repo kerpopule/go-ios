@@ -18,13 +18,33 @@
 // lockdown refused every connect with error code:2, so presence would still
 // have sworn everything was fine. It means "I opened the lockdown channel
 // installationproxy opens first and the phone answered", or else down/unknown.
+//
+// # No-mux mode (the relay tunnel road)
+//
+// On the relay tunnel road there is no usbmux row for the phone at all: the
+// phone is reached only through a CoreDevice tunnel that coagent-rppair holds
+// open, and lockdown on the phone's relay address always resets. With
+// COAGENT_PHONE_NO_MUX=1 (plus COAGENT_PHONE_ADDR, COAGENT_PHONE_RSD and,
+// optionally, COAGENT_PHONE_UDID) this binary runs with no usbmux dependency:
+//
+//	tunnel (RSD/DTX)                     -> /screenshot, /launch, /tap, /swipe
+//	tunnel (installation_proxy RSD shim) -> /apps
+//
+// The device is resolved from the pinned tunnel address and an RSD handshake
+// alone; the UDID is the one the handshake reports, checked against
+// COAGENT_PHONE_UDID when that is set. usbmuxd and the 127.0.0.1:28100 tunnel
+// agent are never asked. The switch is read once in main(), never at call
+// time, so a developer shell with it exported cannot flip the unit tests.
+// The /status wire shape is the same in both modes.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -52,6 +72,9 @@ import (
 const (
 	svcScreenshot = "com.apple.instruments.dtservicehub"
 	svcHID        = "com.apple.coredevice.hid.universalhidservice"
+
+	// svcAppsShim is what /apps and the apps probe open in no-mux mode.
+	svcAppsShim = installationproxy.ShimServiceName
 )
 
 // Reasons. The daemon turns these into the words the user hears, so states that
@@ -62,6 +85,12 @@ const (
 	reasonAppsUnreadable = "phone_apps_unreadable"     // phone is here, but lockdown/installationproxy would not open
 	reasonAppsFailed     = "phone_apps_failed"         // proxy opened, the app listing itself failed
 	reasonAppsUnprobed   = "phone_apps_unprobed"       // the lockdown probe is switched off: nothing was established
+
+	// No-mux mode only.
+	reasonWrongDevice           = "phone_wrong_device"            // the tunnel answers, but as a different phone than COAGENT_PHONE_UDID
+	reasonAppsRemoteUnavailable = "phone_apps_unavailable_remote" // the phone's RSD table does not list the installation_proxy shim
+	reasonTunnelEnvInvalid      = "phone_tunnel_env_invalid"      // the no-mux switch or its tunnel pin will not parse
+	reasonNoMux                 = "phone_no_mux"                  // something tried to read usbmux in no-mux mode (a bug, never a phone state)
 )
 
 // reasonMuxUnreachable replaced an earlier reason string, phone_list_failed,
@@ -79,6 +108,7 @@ const (
 	proofRSD      = "rsd_service_table" // the freshly handshaken RSD service table
 	proofLockdown = "lockdown_session"  // the lockdown channel installationproxy opens first
 	proofListed   = "apps_listed"       // a real /apps listing already answered
+	proofShim     = "rsd_shim_checkin"  // no-mux: the installation_proxy shim accepted an RSDCheckin
 
 	// envAppsProbe=off turns the lockdown probe off. Then "apps" is reported
 	// unknown — never up — because nothing has been established.
@@ -89,6 +119,81 @@ const (
 // polling /status must not open a new lockdown session every poll, and a
 // seconds-old answer is still an answer the phone actually gave.
 var appsProbeTTL = 5 * time.Second
+
+// No-mux budgets. The bridge gives a /status call 12 s and the daemon gives
+// every route 20 s, so each step over the relay tunnel is bounded well inside
+// those: a handshake, then (for /status) one shim checkin, or (for /apps) a
+// checkin plus the listing.
+var (
+	noMuxHandshakeTimeout = 6 * time.Second
+	shimCheckinTimeout    = 4 * time.Second
+	shimListTimeout       = 15 * time.Second
+)
+
+// Environment for no-mux mode. Read once, in main(), by parseNoMux.
+const (
+	envNoMux = "COAGENT_PHONE_NO_MUX"
+	envAddr  = "COAGENT_PHONE_ADDR"
+	envRsd   = "COAGENT_PHONE_RSD"
+	envUDID  = "COAGENT_PHONE_UDID"
+
+	// connNoMux labels a device resolved without usbmux. It must never be
+	// "USB": nothing in no-mux mode may look like the cable to cable-wins code.
+	connNoMux = "Tunnel"
+
+	// muxGuard is where go-ios's own usbmux lookups are pointed in no-mux
+	// mode: a path under /dev/null can never be a socket, so a library path
+	// that reaches for usbmux (instruments' failure-path version check, for
+	// one) fails at once instead of asking Apple's usbmuxd or lanmux.
+	muxGuard = "unix:///dev/null/coagent-phoned-no-mux"
+)
+
+// noMuxPin is the no-mux switch and the tunnel it pins. It is fixed for the
+// life of the process: the bridge restarts phoned when the tunnel moves.
+type noMuxPin struct {
+	on   bool
+	addr string // tunnel address of the phone, e.g. fd0b:a682:6f11::1
+	rsd  int    // RSD port on that address
+	udid string // expected UDID; empty accepts whichever phone answers
+}
+
+// noMux is set once by main() (and by tests through useNoMux). Its zero value
+// is the usbmux mode every pre-existing test runs in.
+var noMux noMuxPin
+
+// parseNoMux reads the no-mux switch and its pin through getenv. Off unless
+// the switch is exactly "1"; any other non-empty value except "0" is refused
+// rather than quietly running the usbmux mode on a road that has no usbmux.
+func parseNoMux(getenv func(string) string) (noMuxPin, error) {
+	switch v := strings.TrimSpace(getenv(envNoMux)); v {
+	case "", "0":
+		return noMuxPin{}, nil
+	case "1":
+	default:
+		return noMuxPin{}, fmt.Errorf("%s: %s must be 1 or unset, got %q", reasonTunnelEnvInvalid, envNoMux, v)
+	}
+	addr := strings.TrimSpace(getenv(envAddr))
+	if net.ParseIP(addr) == nil {
+		return noMuxPin{}, fmt.Errorf("%s: %s=1 needs %s to be the tunnel's IP address, got %q", reasonTunnelEnvInvalid, envNoMux, envAddr, addr)
+	}
+	rsd, err := strconv.Atoi(strings.TrimSpace(getenv(envRsd)))
+	if err != nil || rsd <= 0 || rsd > 65535 {
+		return noMuxPin{}, fmt.Errorf("%s: %s=1 needs %s to be the tunnel's RSD port, got %q", reasonTunnelEnvInvalid, envNoMux, envRsd, getenv(envRsd))
+	}
+	return noMuxPin{on: true, addr: addr, rsd: rsd, udid: strings.TrimSpace(getenv(envUDID))}, nil
+}
+
+// useNoMux switches the process into no-mux mode: the device comes from the
+// pinned tunnel, the app list rides the RSD shim, and the usbmux seam refuses.
+func useNoMux(pin noMuxPin) {
+	pin.on = true
+	noMux = pin
+	resolve = resolveNoMux
+	listApps = listAppsShim
+	listDevices = func() (ios.DeviceList, error) {
+		return ios.DeviceList{}, fmt.Errorf("%s: usbmux is not consulted on this road", reasonNoMux)
+	}
+}
 
 // listDevices and resolve are indirected so tests can drive every branch with a
 // fake. Nothing in a test may touch the user's actual phone.
@@ -131,7 +236,64 @@ var (
 		}
 		return p, nil
 	}
+
+	// handshakeNoMux is the no-mux handshake: the same two reasons as
+	// handshake, but bounded end to end, and it keeps the UDID the phone
+	// reports, because in no-mux mode nothing else can say which phone this is.
+	handshakeNoMux = func(info tunnel.Tunnel, d ios.DeviceEntry) (ios.RsdPortProvider, string, error) {
+		res, err := ios.RsdHandshakeWithTimeout(info.Address, info.RsdPort, d, noMuxHandshakeTimeout)
+		if errors.Is(err, ios.ErrRsdConnect) {
+			return nil, "", fmt.Errorf("phone_tunnel_unreachable: %w", err)
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("phone_handshake_failed: %w", err)
+		}
+		return res, res.Udid, nil
+	}
+
+	// probeShim is the no-mux apps probe: it opens the installation_proxy shim
+	// over the tunnel, does the RSDCheckin with both replies checked, and
+	// closes it again, all inside shimCheckinTimeout. Like probeLockdown it
+	// lists nothing, launches nothing and draws nothing.
+	probeShim = func(d ios.DeviceEntry) error {
+		if err := shimListed(d); err != nil {
+			return err
+		}
+		c, err := ios.ConnectToShimServiceWithTimeout(d, svcAppsShim, shimCheckinTimeout)
+		if err != nil {
+			return fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
+		}
+		c.Close()
+		return nil
+	}
 )
+
+// shimListed: does this device's RSD table offer the installation_proxy shim?
+func shimListed(d ios.DeviceEntry) error {
+	if d.Rsd == nil || d.Rsd.GetPort(svcAppsShim) == 0 {
+		return fmt.Errorf("%s: %s is not in the phone's RSD service table", reasonAppsRemoteUnavailable, svcAppsShim)
+	}
+	return nil
+}
+
+// shimSeen remembers whether the last no-mux handshake listed the shim
+// (0 = not yet known, 1 = listed, 2 = absent), so the log says it once per
+// change instead of once per /status poll.
+var shimSeen atomic.Int32
+
+func logShimListing(p ios.RsdPortProvider) {
+	port, now := p.GetPort(svcAppsShim), int32(2)
+	if port != 0 {
+		now = 1
+	}
+	if shimSeen.Swap(now) != now {
+		if now == 1 {
+			log.Printf("no-mux: RSD lists %s on port %d", svcAppsShim, port)
+		} else {
+			log.Printf("no-mux: RSD does not list %s; /apps will report %s", svcAppsShim, reasonAppsRemoteUnavailable)
+		}
+	}
+}
 
 type bridge struct {
 	mu     sync.Mutex
@@ -164,7 +326,7 @@ type bridge struct {
 // appsProof is one remembered answer from the app-list channel.
 type appsProof struct {
 	at    time.Time
-	key   string // udid#deviceID the answer belongs to; a re-attach retires it
+	key   string // appsKey of the device the answer belongs to; a re-attach (or a new tunnel) retires it
 	err   error
 	proof string
 }
@@ -245,6 +407,27 @@ func resolveDevice() (ios.DeviceEntry, error) {
 	}
 	d.Address = info.Address
 	d.Rsd = provider
+	return d, nil
+}
+
+// resolveNoMux is resolveDevice for the road with no usbmux row: the device is
+// the pinned tunnel and whatever phone answers an RSD handshake on it. It never
+// calls listDevices and never asks the 127.0.0.1:28100 tunnel agent, whose
+// registry belongs to `ios tunnel start` and can still hold a dead tunnel for
+// the same UDID (chooseTunnel would prefer that live-looking answer).
+func resolveNoMux() (ios.DeviceEntry, error) {
+	pin := noMux
+	d := ios.DeviceEntry{Address: pin.addr, Properties: ios.DeviceProperties{ConnectionType: connNoMux}}
+	p, udid, err := handshakeNoMux(tunnel.Tunnel{Address: pin.addr, RsdPort: pin.rsd, Udid: pin.udid}, d)
+	if err != nil {
+		return d, err
+	}
+	if pin.udid != "" && !strings.EqualFold(udid, pin.udid) {
+		return d, fmt.Errorf("%s: the tunnel at [%s]:%d answers as %s, not %s", reasonWrongDevice, pin.addr, pin.rsd, udid, pin.udid)
+	}
+	logShimListing(p)
+	d.Properties.SerialNumber = udid
+	d.Rsd = p
 	return d, nil
 }
 
@@ -390,7 +573,17 @@ func (b *bridge) withHID(fn func(*hid.Session) error) error {
 // cacheLive re-checks the cached entry against the local usbmux list. If usbmuxd
 // itself will not answer we have not DISPROVED the cache, so we keep it: the
 // tunnel routes may well still work and guessing "gone" would be its own lie.
+//
+// In no-mux mode there is no local list to check against, so the cache is
+// trusted as long as it belongs to the pinned tunnel (address and, because the
+// pin is fixed for the process, its RSD port). A dead tunnel is still caught:
+// withDevice's retry re-resolves, and a failed re-resolve condemns the
+// session. Consulting usbmux here instead would find nothing and throw the
+// gesture session away on every call.
 func cacheLive(d ios.DeviceEntry) bool {
+	if noMux.on {
+		return d.Address == noMux.addr && d.Rsd != nil && d.Properties.SerialNumber != ""
+	}
 	live, err := listDevices()
 	if err != nil {
 		return true
@@ -457,7 +650,14 @@ func (b *bridge) withDevice(fn func(ios.DeviceEntry) error) error {
 // installationproxy over usbmux and never uses the tunnel, so it must not be made
 // to fail on a tunnel handshake it does not need — and it must use the CURRENT
 // DeviceID, not the one cached when the tunnel was first built.
+//
+// In no-mux mode the app list rides the tunnel (the installation_proxy RSD
+// shim), so the device it needs IS the tunnel device: the cached one, or a
+// freshly handshaken one.
 func (b *bridge) appsDevice() (ios.DeviceEntry, error) {
+	if noMux.on {
+		return b.device()
+	}
 	live, err := listDevices()
 	if err != nil {
 		return ios.DeviceEntry{}, fmt.Errorf("%s: %w", reasonMuxUnreachable, err)
@@ -522,6 +722,38 @@ func listAppsOn(d ios.DeviceEntry) ([]map[string]any, error) {
 		return nil, fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
 	}
 	defer ip.Close()
+	return browseRows(ip)
+}
+
+// listAppsShim is listAppsOn for no-mux mode: the same listing, over the
+// installation_proxy RSD shim instead of usbmux + lockdown, and bounded. Only
+// the connection differs, so the rows and the two failure words are the same.
+func listAppsShim(d ios.DeviceEntry) ([]map[string]any, error) {
+	if err := shimListed(d); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(shimListTimeout)
+	conn, err := ios.ConnectToShimServiceWithTimeout(d, svcAppsShim, shimCheckinTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", reasonAppsUnreadable, err)
+	}
+	ip := installationproxy.NewWithConnection(conn)
+	var once sync.Once
+	closeIP := func() { once.Do(ip.Close) }
+	defer closeIP()
+	// installationproxy has no deadline of its own. Closing the connection
+	// from a timer is what unblocks a browse the phone stopped answering.
+	var expired atomic.Bool
+	timer := time.AfterFunc(time.Until(deadline), func() { expired.Store(true); closeIP() })
+	defer timer.Stop()
+	out, err := browseRows(ip)
+	if err != nil && expired.Load() {
+		return nil, fmt.Errorf("%s: no complete app list within %s: %w", reasonAppsFailed, shimListTimeout, err)
+	}
+	return out, err
+}
+
+func browseRows(ip *installationproxy.Connection) ([]map[string]any, error) {
 	out := []map[string]any{}
 	for _, browse := range []func() ([]installationproxy.AppInfo, error){ip.BrowseUserApps, ip.BrowseSystemApps} {
 		apps, err := browse()
@@ -572,6 +804,11 @@ func (b *bridge) noteApps(d ios.DeviceEntry, err error, proof string) {
 }
 
 func appsKey(d ios.DeviceEntry) string {
+	if noMux.on {
+		// DeviceID is always 0 without usbmux, so the tunnel is what tells one
+		// answer from the next: a re-armed tunnel is a new question.
+		return d.Properties.SerialNumber + "#" + d.Address + "#" + strconv.Itoa(noMux.rsd)
+	}
 	return d.Properties.SerialNumber + "#" + strconv.Itoa(d.DeviceID)
 }
 
@@ -609,7 +846,19 @@ type status struct {
 // appsCapability answers what /apps would do, by opening the channel /apps
 // opens. Presence on the usbmux bus is not evidence: the incident state was a
 // phone present on the bus whose lockdown channel refused with error code:2.
+//
+// In no-mux mode the channel is the installation_proxy RSD shim, and the table
+// the handshake just returned is consulted first: a phone whose RSD does not
+// list the shim cannot give an app list over this road, whatever was
+// remembered, and that is established without opening anything.
 func (b *bridge) appsCapability(d ios.DeviceEntry) capability {
+	probeApps, proof, channel := probeLockdown, proofLockdown, "the lockdown channel"
+	if noMux.on {
+		if err := shimListed(d); err != nil {
+			return capability{State: capDown, Proof: proofRSD, Reason: reasonOf(err), Detail: err.Error()}
+		}
+		probeApps, proof, channel = probeShim, proofShim, "the installation_proxy shim"
+	}
 	// The remembered answer comes FIRST, before the probe switch. envAppsProbe
 	// bounds what this function may OPEN; it is not permission to forget what
 	// the phone already said. Reading it first threw away an /apps listing that
@@ -631,10 +880,10 @@ func (b *bridge) appsCapability(d ios.DeviceEntry) capability {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(envAppsProbe)), "off") {
 		// Nothing is in hand and nothing may be opened, so nothing is claimed.
 		return capability{State: capUnknown, Reason: reasonAppsUnprobed,
-			Detail: envAppsProbe + "=off: the lockdown channel was not opened"}
+			Detail: envAppsProbe + "=off: " + channel + " was not opened"}
 	}
-	err := probeLockdown(d)
-	b.noteApps(d, err, proofLockdown)
+	err := probeApps(d)
+	b.noteApps(d, err, proof)
 	b.probeMu.Lock()
 	fresh := b.appsProof
 	b.probeMu.Unlock()
@@ -649,6 +898,9 @@ func appsCapabilityFor(p appsProof) capability {
 }
 
 func (b *bridge) probe() status {
+	if noMux.on {
+		return b.probeNoMux()
+	}
 	st := status{}
 
 	// apps: usbmux presence first (a local unix socket; it never reaches the
@@ -680,25 +932,34 @@ func (b *bridge) probe() status {
 		if st.UDID == "" {
 			st.UDID = d.Properties.SerialNumber
 		}
-		if d.Rsd == nil {
-			down := capability{State: capDown, Reason: "phone_handshake_failed"}
-			st.See, st.Act = down, down
-		} else {
-			st.See = capability{State: capUp, Proof: proofRSD}
-			st.Act = capability{State: capUp, Proof: proofRSD}
-			if d.Rsd.GetPort(svcScreenshot) == 0 {
-				st.See = capability{State: capDown, Proof: proofRSD, Reason: "phone_capture_failed"}
-			}
-			if d.Rsd.GetPort(svcHID) == 0 {
-				// dtuhidd ships in the developer disk image, not in iOS.
-				st.Act = capability{State: capDown, Proof: proofRSD, Reason: "phone_hid_failed"}
-			}
-		}
+		st.See, st.Act = seeAct(d)
 		b.devMu.Lock()
 		b.devCopy, b.devReady = d, true
 		b.devMu.Unlock()
 	}
+	return st.summarize()
+}
 
+// seeAct reads "see" and "act" out of a freshly handshaken RSD table.
+func seeAct(d ios.DeviceEntry) (see, act capability) {
+	if d.Rsd == nil {
+		down := capability{State: capDown, Reason: "phone_handshake_failed"}
+		return down, down
+	}
+	see = capability{State: capUp, Proof: proofRSD}
+	act = capability{State: capUp, Proof: proofRSD}
+	if d.Rsd.GetPort(svcScreenshot) == 0 {
+		see = capability{State: capDown, Proof: proofRSD, Reason: "phone_capture_failed"}
+	}
+	if d.Rsd.GetPort(svcHID) == 0 {
+		// dtuhidd ships in the developer disk image, not in iOS.
+		act = capability{State: capDown, Proof: proofRSD, Reason: "phone_hid_failed"}
+	}
+	return see, act
+}
+
+// summarize fills OK and the single reason from the three capabilities.
+func (st status) summarize() status {
 	st.OK = st.See.up() && st.Act.up() && st.Apps.up()
 	// The single reason is for a caller that reads one string; the capabilities
 	// are the truth. apps leads because that is the one that was lied about.
@@ -709,6 +970,30 @@ func (b *bridge) probe() status {
 		}
 	}
 	return st
+}
+
+// probeNoMux is probe() for the road with no usbmux: every capability rides
+// the one tunnel, so it is resolved first (a fresh, bounded handshake) and
+// the app channel is then probed over the RSD shim on that same tunnel. If the
+// tunnel does not answer, all three are down for that one reason. The
+// UDID reported is only ever the one the handshake proved.
+func (b *bridge) probeNoMux() status {
+	st := status{}
+	d, err := resolve()
+	if err != nil {
+		down := capability{State: capDown, Reason: reasonOf(err), Detail: err.Error()}
+		st.See, st.Act, st.Apps = down, down, down
+		// Observe, do not condemn: see probe().
+		b.dropDevice()
+		return st.summarize()
+	}
+	st.UDID = d.Properties.SerialNumber
+	st.See, st.Act = seeAct(d)
+	st.Apps = b.appsCapability(d)
+	b.devMu.Lock()
+	b.devCopy, b.devReady = d, true
+	b.devMu.Unlock()
+	return st.summarize()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -770,6 +1055,15 @@ func main() {
 	}
 	if !strings.HasPrefix(addr, "127.0.0.1:") {
 		log.Fatal("loopback only")
+	}
+	// The no-mux switch is read here and nowhere else.
+	pin, err := parseNoMux(os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if pin.on {
+		useNoMux(pin)
+		os.Setenv("USBMUXD_SOCKET_ADDRESS", muxGuard)
 	}
 	b := &bridge{}
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
@@ -908,6 +1202,10 @@ func main() {
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "apps": out})
 	}))
-	log.Printf("coagent-phoned on %s", addr)
+	if noMux.on {
+		log.Printf("coagent-phoned on %s (no-mux: tunnel [%s]:%d, expected udid %q)", addr, noMux.addr, noMux.rsd, noMux.udid)
+	} else {
+		log.Printf("coagent-phoned on %s", addr)
+	}
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
