@@ -1001,3 +1001,16 @@ func TestTunnelAgentIsTheGoIosAgentAPI(t *testing.T) {
 		t.Fatalf("GO_IOS_AGENT_PORT ignored: got %d", port)
 	}
 }
+
+func TestLaunchReasonNamesALockedPhone(t *testing.T) {
+	locked := errors.New("Request to launch com.apple.mobilemail failed. Unable to launch com.apple.mobilemail because the device was not, or could not be, unlocked. (FBSOpenApplicationErrorDomain error 7 Locked)")
+	if got := launchReason(locked); got != "phone_locked" {
+		t.Fatalf("locked launch: got %q, want phone_locked", got)
+	}
+	if got := launchReason(errors.New("no app with bundle id com.example.gone")); got != "phone_launch_failed" {
+		t.Fatalf("other launch failure: got %q, want phone_launch_failed", got)
+	}
+	if got := reasonOf(fmt.Errorf("%s: %w", launchReason(locked), locked)); got != "phone_locked" {
+		t.Fatalf("reasonOf: got %q, want phone_locked", got)
+	}
+}

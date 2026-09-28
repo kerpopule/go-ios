@@ -62,6 +62,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1250,6 +1251,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// lockedLaunch is iOS's own wording when it refuses to open an app because the
+// phone is locked (FBSOpenApplicationErrorDomain error 7, "Locked": "the device
+// was not, or could not be, unlocked").
+var lockedLaunch = regexp.MustCompile(`(?i)\blocked\b|could not be,? unlocked`)
+
+// launchReason names a refused launch. A locked phone is the one refusal the
+// person holding it can fix, so it gets its own reason instead of the generic
+// phone_launch_failed (2026-09-28: the voice must say "unlock your phone").
+func launchReason(err error) string {
+	if err != nil && lockedLaunch.MatchString(err.Error()) {
+		return "phone_locked"
+	}
+	return "phone_launch_failed"
+}
+
 func reasonOf(err error) string {
 	msg := err.Error()
 	if i := strings.Index(msg, ":"); i > 0 {
@@ -1445,12 +1461,12 @@ func main() {
 		err := b.withDevice(func(d ios.DeviceEntry) error {
 			pc, err := instruments.NewProcessControl(d)
 			if err != nil {
-				return fmt.Errorf("phone_launch_failed: %w", err)
+				return fmt.Errorf("%s: %w", launchReason(err), err)
 			}
 			defer pc.Close()
 			p, err := pc.LaunchApp(id, map[string]any{})
 			if err != nil {
-				return fmt.Errorf("phone_launch_failed: %w", err)
+				return fmt.Errorf("%s: %w", launchReason(err), err)
 			}
 			pid = p
 			return nil
