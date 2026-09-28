@@ -32,8 +32,8 @@
 //
 // The device is resolved from the pinned tunnel address and an RSD handshake
 // alone; the UDID is the one the handshake reports, checked against
-// COAGENT_PHONE_UDID when that is set. usbmuxd and the 127.0.0.1:28100 tunnel
-// agent are never asked. The switch is read once in main(), never at call
+// COAGENT_PHONE_UDID when that is set. usbmuxd and the go-ios tunnel agent
+// (tunnelAgent) are never asked. The switch is read once in main(), never at call
 // time, so a developer shell with it exported cannot flip the unit tests.
 // The /status wire shape is the same in both modes.
 //
@@ -491,7 +491,8 @@ func resolveDevice() (ios.DeviceEntry, error) {
 		return ios.DeviceEntry{}, err
 	}
 	udid := dev.Properties.SerialNumber
-	live, liveErr := tunnelInfoForDevice(udid, "127.0.0.1", 28100)
+	host, port := tunnelAgent()
+	live, liveErr := tunnelInfoForDevice(udid, host, port)
 	info, err := chooseTunnel(udid, live, liveErr, os.Getenv("COAGENT_PHONE_ADDR"), os.Getenv("COAGENT_PHONE_RSD"))
 	if err != nil {
 		return dev, err
@@ -522,7 +523,7 @@ func resolveDevice() (ios.DeviceEntry, error) {
 
 // resolveNoMux is resolveDevice for the road with no usbmux row: the device is
 // the pinned tunnel and whatever phone answers an RSD handshake on it. It never
-// calls listDevices and never asks the 127.0.0.1:28100 tunnel agent, whose
+// calls listDevices and never asks the go-ios tunnel agent (tunnelAgent), whose
 // registry belongs to `ios tunnel start` and can still hold a dead tunnel for
 // the same UDID (chooseTunnel would prefer that live-looking answer).
 func resolveNoMux() (ios.DeviceEntry, error) {
@@ -1259,6 +1260,20 @@ func reasonOf(err error) string {
 
 func fail(w http.ResponseWriter, err error) {
 	writeJSON(w, 502, map[string]any{"ok": false, "reason": reasonOf(err), "detail": err.Error()})
+}
+
+// tunnelAgent is WHERE `ios tunnel start` publishes its tunnels: go-ios's own
+// agent API (127.0.0.1:60105, or GO_IOS_AGENT_HOST / GO_IOS_AGENT_PORT).
+//
+// This used to be a hard-coded 127.0.0.1:28100, the port of an older go-ios.
+// Nothing listens there, so the live lookup ALWAYS failed and chooseTunnel
+// always fell back to the address pinned at launch. Over Wi-Fi the tunnel is
+// rebuilt with a new address every time the phone sleeps ("SleepyTime"), so
+// within minutes the bridge was dialling a dead address: see and act down
+// with phone_tunnel_unreachable while the tunnel itself was up (2026-09-28,
+// "open my mail app" refused with the tunnel on).
+func tunnelAgent() (string, int) {
+	return ios.HttpApiHost(), ios.HttpApiPort()
 }
 
 // tunnelInfoForDevice is a seam so the choice below can be tested without a tunnel.

@@ -984,3 +984,20 @@ func TestChooseTunnelFallsBackToThePinnedAddressWhenTheInfoServiceIsDead(t *test
 		t.Fatalf("an empty live answer beat the pinned address: %+v %v", got, err)
 	}
 }
+
+// The live tunnel lookup must ask the go-ios agent that `ios tunnel start`
+// actually runs (60105 by default), never the retired 28100: asking a port
+// nobody listens on made every lookup fail, so the bridge stayed pinned to a
+// Wi-Fi tunnel address that had long since been replaced (2026-09-28).
+func TestTunnelAgentIsTheGoIosAgentAPI(t *testing.T) {
+	t.Setenv("GO_IOS_AGENT_HOST", "")
+	t.Setenv("GO_IOS_AGENT_PORT", "")
+	host, port := tunnelAgent()
+	if host != "127.0.0.1" || port != 60105 {
+		t.Fatalf("tunnelAgent() = %s:%d, want 127.0.0.1:60105", host, port)
+	}
+	t.Setenv("GO_IOS_AGENT_PORT", "60200")
+	if _, port := tunnelAgent(); port != 60200 {
+		t.Fatalf("GO_IOS_AGENT_PORT ignored: got %d", port)
+	}
+}
