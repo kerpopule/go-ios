@@ -69,12 +69,61 @@ func New(device ios.DeviceEntry) (*Connection, error) {
 	return &Connection{deviceConn: deviceConn, plistCodec: ios.NewPlistCodec()}, nil
 }
 
+// ShimServiceName is the installation_proxy shim listed in the RSD table of an
+// iOS 17+ tunnel. RsdHandshakeResponse.GetPort matches names exactly, so the
+// full name must be used.
+const ShimServiceName = "com.apple.mobile.installation_proxy.shim.remote"
+
+// NewWithShimConnection connects to installation_proxy over a tunnel interface:
+// the port comes from remote service discovery and the RSDCheckin the shim
+// requires is done before returning. No usbmuxd, lockdown session or pair
+// record is involved. New is unchanged and still takes the usbmuxd road.
+func NewWithShimConnection(device ios.DeviceEntry) (*Connection, error) {
+	deviceConn, err := ios.ConnectToShimService(device, ShimServiceName)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithConnection(deviceConn), nil
+}
+
+// NewWithConnection wraps a connection that is already open to the
+// installation_proxy service (or its shim, after RSDCheckin), for callers that
+// open it themselves, for example with ios.ConnectToShimServiceWithTimeout.
+func NewWithConnection(deviceConn ios.DeviceConnectionInterface) *Connection {
+	return &Connection{deviceConn: deviceConn, plistCodec: ios.NewPlistCodec()}
+}
+
 func (conn *Connection) BrowseUserApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("User", true))
 }
 
 func (conn *Connection) BrowseSystemApps() ([]AppInfo, error) {
 	return conn.browseApps(browseApps("System", false))
+}
+
+// BrowseUserAppsWithAttributes is BrowseUserApps asking the device for only the
+// named keys of each app (ClientOptions.ReturnAttributes). An app lacking a key
+// simply comes back without it. With no keys it is BrowseUserApps. Over a slow
+// link this is the difference between every attribute of every app and a
+// handful of short strings.
+func (conn *Connection) BrowseUserAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(withReturnAttributes(browseApps("User", true), attributes))
+}
+
+// BrowseSystemAppsWithAttributes is BrowseSystemApps with ReturnAttributes, as
+// BrowseUserAppsWithAttributes.
+func (conn *Connection) BrowseSystemAppsWithAttributes(attributes []string) ([]AppInfo, error) {
+	return conn.browseApps(withReturnAttributes(browseApps("System", false), attributes))
+}
+
+func withReturnAttributes(request map[string]interface{}, attributes []string) map[string]interface{} {
+	if len(attributes) == 0 {
+		return request
+	}
+	if opts, ok := request["ClientOptions"].(map[string]any); ok {
+		opts["ReturnAttributes"] = append([]string(nil), attributes...)
+	}
+	return request
 }
 
 func (conn *Connection) BrowseFileSharingApps() ([]AppInfo, error) {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/danielpaulus/go-ios/ios/http"
@@ -310,10 +311,30 @@ const TunnelDialTimeout = 15 * time.Second
 // the signature of a dead tunnel whose interface lingers.
 var ErrDialTimeout = errors.New("dial timed out")
 
+// tunnelDialOverride, when positive, replaces TunnelDialTimeout for
+// DialTunnelTCP in this process. Zero (the default) keeps TunnelDialTimeout.
+var tunnelDialOverride atomic.Int64
+
+// SetTunnelDialTimeout changes the bound DialTunnelTCP (and so every service
+// dial over a kernel tunnel) applies, for the whole process. It is meant for a
+// process that only ever talks to one tunnel whose answers it must fit inside a
+// fixed budget; zero or a negative value restores TunnelDialTimeout.
+func SetTunnelDialTimeout(timeout time.Duration) {
+	if timeout < 0 {
+		timeout = 0
+	}
+	tunnelDialOverride.Store(int64(timeout))
+}
+
 // DialTunnelTCP connects to a tunnel/RSD TCP endpoint (address in the form
-// accepted by net.Dial, e.g. "[fd00::1]:1234") with TunnelDialTimeout.
+// accepted by net.Dial, e.g. "[fd00::1]:1234") with TunnelDialTimeout, or the
+// bound set with SetTunnelDialTimeout.
 func DialTunnelTCP(address string) (*net.TCPConn, error) {
-	return DialTunnelTCPWithTimeout(address, TunnelDialTimeout)
+	timeout := TunnelDialTimeout
+	if o := time.Duration(tunnelDialOverride.Load()); o > 0 {
+		timeout = o
+	}
+	return DialTunnelTCPWithTimeout(address, timeout)
 }
 
 // DialTunnelTCPWithTimeout is DialTunnelTCP with a caller-chosen timeout.

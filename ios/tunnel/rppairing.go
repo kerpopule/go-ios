@@ -1,9 +1,11 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -59,6 +61,23 @@ type rpPairingConn struct {
 func dialRemotePairing(address string, timeout time.Duration) (*rpPairingConn, error) {
 	conn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
+		return nil, fmt.Errorf("dialRemotePairing: failed to reach %s: %w", address, err)
+	}
+	return &rpPairingConn{conn: conn, scratch: make([]byte, 0, 4096)}, nil
+}
+
+// dialRemotePairingVia is dialRemotePairing with the connection opened by dial (for example
+// StreamsDialer) instead of a direct TCP connect, bounded by timeout. leg names the RemotePairing leg
+// on a streams failure.
+func dialRemotePairingVia(ctx context.Context, dial RemotePairingDialer, address string, timeout time.Duration, leg string) (*rpPairingConn, error) {
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := dial(dctx, address)
+	if err == nil && conn == nil {
+		err = errors.New("dialer returned no connection")
+	}
+	if err != nil {
+		tagStreamsLeg(err, leg)
 		return nil, fmt.Errorf("dialRemotePairing: failed to reach %s: %w", address, err)
 	}
 	return &rpPairingConn{conn: conn, scratch: make([]byte, 0, 4096)}, nil

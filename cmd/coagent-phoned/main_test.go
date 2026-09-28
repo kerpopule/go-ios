@@ -791,7 +791,7 @@ func tunnelEnv(t *testing.T) {
 func stubHandshake(t *testing.T, p ios.RsdPortProvider, err error) {
 	t.Helper()
 	old := handshake
-	handshake = func(tunnel.Tunnel, ios.DeviceEntry) (ios.RsdPortProvider, error) { return p, err }
+	handshake = func(tunnel.Tunnel, ios.DeviceEntry, time.Duration) (ios.RsdPortProvider, error) { return p, err }
 	t.Cleanup(func() { handshake = old })
 }
 
@@ -982,5 +982,35 @@ func TestChooseTunnelFallsBackToThePinnedAddressWhenTheInfoServiceIsDead(t *test
 	got, err = chooseTunnel("U", tunnel.Tunnel{}, nil, "fd00::pinned", "50809")
 	if err != nil || got.Address != "fd00::pinned" {
 		t.Fatalf("an empty live answer beat the pinned address: %+v %v", got, err)
+	}
+}
+
+// The live tunnel lookup must ask the go-ios agent that `ios tunnel start`
+// actually runs (60105 by default), never the retired 28100: asking a port
+// nobody listens on made every lookup fail, so the bridge stayed pinned to a
+// Wi-Fi tunnel address that had long since been replaced (2026-09-28).
+func TestTunnelAgentIsTheGoIosAgentAPI(t *testing.T) {
+	t.Setenv("GO_IOS_AGENT_HOST", "")
+	t.Setenv("GO_IOS_AGENT_PORT", "")
+	host, port := tunnelAgent()
+	if host != "127.0.0.1" || port != 60105 {
+		t.Fatalf("tunnelAgent() = %s:%d, want 127.0.0.1:60105", host, port)
+	}
+	t.Setenv("GO_IOS_AGENT_PORT", "60200")
+	if _, port := tunnelAgent(); port != 60200 {
+		t.Fatalf("GO_IOS_AGENT_PORT ignored: got %d", port)
+	}
+}
+
+func TestLaunchReasonNamesALockedPhone(t *testing.T) {
+	locked := errors.New("Request to launch com.apple.mobilemail failed. Unable to launch com.apple.mobilemail because the device was not, or could not be, unlocked. (FBSOpenApplicationErrorDomain error 7 Locked)")
+	if got := launchReason(locked); got != "phone_locked" {
+		t.Fatalf("locked launch: got %q, want phone_locked", got)
+	}
+	if got := launchReason(errors.New("no app with bundle id com.example.gone")); got != "phone_launch_failed" {
+		t.Fatalf("other launch failure: got %q, want phone_launch_failed", got)
+	}
+	if got := reasonOf(fmt.Errorf("%s: %w", launchReason(locked), locked)); got != "phone_locked" {
+		t.Fatalf("reasonOf: got %q, want phone_locked", got)
 	}
 }

@@ -51,7 +51,7 @@ func main() {
 		die("COAGENT_PHONE_RSD", perr)
 		info = tunnel.Tunnel{Address: a, RsdPort: port, Udid: udid}
 	} else {
-		info, err = tunnel.TunnelInfoForDevice(udid, "127.0.0.1", 28100)
+		info, err = tunnel.TunnelInfoForDevice(udid, ios.HttpApiHost(), ios.HttpApiPort())
 		die("tunnel info (is `sudo ios tunnel start` running?)", err)
 	}
 	rsd, err := ios.NewWithAddrPortDevice(info.Address, info.RsdPort, dev)
